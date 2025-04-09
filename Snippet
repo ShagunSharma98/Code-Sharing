@@ -1,0 +1,231 @@
+import boto3
+import time
+import os
+import pandas as pd
+import logging
+
+# --- Configuration ---
+AWS_REGION = "us-east-1"  # Replace with your AWS region
+ATHENA_DATABASE = "your_athena_database" # Replace with your Athena database name
+SOURCE_TABLE = "your_source_table_name" # Replace with your source table name
+
+# S3 bucket for Athena's *intermediate* query results (required by Athena)
+# MUST end with a '/'
+ATHENA_QUERY_OUTPUT_S3 = "s3://your-athena-query-results-bucket/path/"
+
+# S3 bucket and prefix where the FINAL Parquet data will be stored by CTAS
+# MUST end with a '/'
+PARQUET_OUTPUT_S3_LOCATION = "s3://your-parquet-output-bucket/data/"
+
+# Temporary table name for the CTAS operation (can be dropped later)
+CTAS_TABLE_NAME = "temp_ctas_output_table"
+
+# Your specific WHERE clause conditions
+WHERE_CONDITIONS = "column1 = 'value1' AND column2 > 100 AND date_column BETWEEN '2023-01-01' AND '2023-12-31'" # Replace with your actual conditions
+
+# Polling configuration
+POLL_INTERVAL_SECONDS = 5
+QUERY_TIMEOUT_MINUTES = 60 # Adjust based on expected query time
+
+# Setup logging
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+
+# --- Helper Function ---
+def poll_query_status(athena_client, query_execution_id, timeout_minutes):
+    """Polls Athena for query status until completion or timeout."""
+    start_time = time.time()
+    timeout_seconds = timeout_minutes * 60
+    while True:
+        elapsed_time = time.time() - start_time
+        if elapsed_time > timeout_seconds:
+            logging.error(f"Query timed out after {timeout_minutes} minutes.")
+            # Optionally try to stop the query
+            try:
+                athena_client.stop_query_execution(QueryExecutionId=query_execution_id)
+                logging.info(f"Attempted to stop query {query_execution_id}")
+            except Exception as stop_err:
+                logging.warning(f"Could not stop query {query_execution_id}: {stop_err}")
+            return None # Indicate timeout
+
+        try:
+            response = athena_client.get_query_execution(QueryExecutionId=query_execution_id)
+            status = response['QueryExecution']['Status']['State']
+            logging.info(f"Query {query_execution_id} status: {status}")
+
+            if status in ('SUCCEEDED', 'FAILED', 'CANCELLED'):
+                return response['QueryExecution'] # Return full execution details
+
+        except Exception as e:
+            logging.error(f"Error checking query status for {query_execution_id}: {e}")
+            # Decide if this error is terminal or worth retrying (e.g., throttling)
+            # For simplicity, we'll treat most errors during polling as failures here
+            return None # Indicate failure
+
+        time.sleep(POLL_INTERVAL_SECONDS)
+
+# --- Main Script Logic ---
+def main():
+    athena_client = boto3.client('athena', region_name=AWS_REGION)
+
+    # 1. Construct the CTAS Query
+    #    - Drop the temporary table if it exists (makes the script idempotent)
+    #    - Create the table using CTAS, specifying Parquet format and output location
+    ctas_query = f"""
+    CREATE TABLE {CTAS_TABLE_NAME}
+    WITH (
+        format = 'PARQUET',
+        external_location = '{PARQUET_OUTPUT_S3_LOCATION}',
+        parquet_compression = 'SNAPPY' -- Or GZIP, ZSTD, NONE
+    ) AS
+    SELECT
+        * -- Select specific columns if needed: col1, col2, ...
+    FROM
+        {SOURCE_TABLE}
+    WHERE
+        {WHERE_CONDITIONS};
+    """
+
+    drop_table_query = f"DROP TABLE IF EXISTS {ATHENA_DATABASE}.{CTAS_TABLE_NAME};"
+
+    query_execution_id = None
+    ctas_succeeded = False
+
+    try:
+        # --- Optional: Clean up previous CTAS table definition ---
+        # Note: This only drops the Athena table metadata, not the S3 data
+        logging.info(f"Attempting to drop previous table definition (if exists): {ATHENA_DATABASE}.{CTAS_TABLE_NAME}")
+        try:
+            response = athena_client.start_query_execution(
+                QueryString=drop_table_query,
+                QueryExecutionContext={'Database': ATHENA_DATABASE},
+                ResultConfiguration={'OutputLocation': ATHENA_QUERY_OUTPUT_S3}
+            )
+            drop_exec_id = response['QueryExecutionId']
+            logging.info(f"Started DROP TABLE query with Execution ID: {drop_exec_id}")
+            drop_execution = poll_query_status(athena_client, drop_exec_id, 5) # Short timeout for drop
+            if drop_execution and drop_execution['Status']['State'] == 'SUCCEEDED':
+                 logging.info(f"Successfully dropped previous table definition (if it existed).")
+            elif drop_execution:
+                 logging.warning(f"DROP TABLE query finished with status: {drop_execution['Status']['State']}. Reason: {drop_execution.get('Status', {}).get('StateChangeReason', 'N/A')}")
+            else:
+                 logging.warning(f"Could not confirm status of DROP TABLE query {drop_exec_id}.")
+
+        except Exception as drop_err:
+            logging.warning(f"Could not execute DROP TABLE query (might not exist, or permissions issue): {drop_err}")
+            # Continue execution even if drop fails
+
+        # --- Execute the main CTAS Query ---
+        logging.info("Starting CTAS query...")
+        logging.info(f"Query: \n{ctas_query}") # Log the query for debugging
+
+        response = athena_client.start_query_execution(
+            QueryString=ctas_query,
+            QueryExecutionContext={'Database': ATHENA_DATABASE},
+            ResultConfiguration={
+                'OutputLocation': ATHENA_QUERY_OUTPUT_S3 # Intermediate results location
+                # EncryptionConfiguration can be added here if needed
+            }
+            # WorkGroup can be specified here if needed: WorkGroup='your_workgroup'
+        )
+
+        query_execution_id = response['QueryExecutionId']
+        logging.info(f"CTAS Query started with Execution ID: {query_execution_id}")
+        logging.info(f"Polling for query completion (Timeout: {QUERY_TIMEOUT_MINUTES} mins)...")
+
+        # --- Poll for CTAS Query Completion ---
+        query_execution = poll_query_status(athena_client, query_execution_id, QUERY_TIMEOUT_MINUTES)
+
+        if query_execution is None:
+            logging.error(f"Query {query_execution_id} failed to complete or timed out.")
+            # Optional: Add logic here to handle timeout/failure (e.g., cleanup S3 partial data)
+            raise RuntimeError(f"Athena query {query_execution_id} did not succeed.")
+
+        status = query_execution['Status']['State']
+        if status == 'SUCCEEDED':
+            logging.info(f"CTAS Query {query_execution_id} SUCCEEDED.")
+            logging.info(f"Parquet data successfully written to: {PARQUET_OUTPUT_S3_LOCATION}")
+            ctas_succeeded = True
+
+            # Optional: Log query statistics
+            stats = query_execution.get('Statistics', {})
+            scan_bytes = stats.get('DataScannedInBytes', 'N/A')
+            exec_time_ms = stats.get('TotalExecutionTimeInMillis', 'N/A')
+            logging.info(f"Query Stats: Scanned Bytes={scan_bytes}, Execution Time (ms)={exec_time_ms}")
+
+        else:
+            reason = query_execution.get('Status', {}).get('StateChangeReason', 'No reason provided')
+            logging.error(f"CTAS Query {query_execution_id} finished with status: {status}. Reason: {reason}")
+            raise RuntimeError(f"Athena query {query_execution_id} failed: {status} - {reason}")
+
+    except Exception as e:
+        logging.exception(f"An error occurred during Athena query execution: {e}")
+        # Optional: Attempt cleanup or raise the exception
+        raise e # Re-raise the exception after logging
+
+    # --- Read the Parquet Data from S3 (if CTAS succeeded) ---
+    if ctas_succeeded:
+        logging.info(f"\n--- Reading Parquet data from S3: {PARQUET_OUTPUT_S3_LOCATION} ---")
+        try:
+            # pandas + s3fs + pyarrow handle reading directly from S3
+            # This reads the *entire* dataset into memory.
+            # For 45M rows, this might still require significant RAM.
+            start_read = time.time()
+            logging.info("Starting Parquet read from S3 into Pandas DataFrame...")
+            # Ensure s3fs is used implicitly by pandas for s3:// paths
+            df = pd.read_parquet(PARQUET_OUTPUT_S3_LOCATION, engine='pyarrow')
+            end_read = time.time()
+            logging.info(f"Successfully read Parquet data into DataFrame (Shape: {df.shape}) in {end_read - start_read:.2f} seconds.")
+
+            # --- Process the DataFrame ---
+            logging.info("\n--- Processing Data (Example: Displaying info and head) ---")
+            print("\nDataFrame Info:")
+            df.info(memory_usage='deep') # Show memory usage
+
+            print("\nDataFrame Head:")
+            print(df.head())
+
+            # Add your data processing logic here
+            # Example:
+            # filtered_df = df[df['some_column'] > threshold]
+            # aggregated_data = df.groupby('category_column').size()
+            # print("\nProcessing complete.")
+
+            # --- Memory Warning ---
+            if df.shape[0] > 10_000_000: # Arbitrary threshold
+                 logging.warning("WARNING: Loaded a large DataFrame into memory.")
+                 logging.warning("Consider using libraries like Dask or Spark for processing if memory becomes an issue,")
+                 logging.warning("or process the Parquet files in chunks if possible.")
+
+
+        except Exception as read_err:
+            logging.exception(f"Error reading Parquet data from {PARQUET_OUTPUT_S3_LOCATION}: {read_err}")
+            logging.error("Check IAM permissions for S3 access and if Parquet files are valid.")
+
+    # --- Optional: Clean up the CTAS table definition in Athena ---
+    # Uncomment the following block if you don't need the Athena table definition
+    # after creating the Parquet files in S3.
+    # if ctas_succeeded:
+    #     logging.info(f"\n--- Cleaning up temporary Athena table: {ATHENA_DATABASE}.{CTAS_TABLE_NAME} ---")
+    #     try:
+    #         response = athena_client.start_query_execution(
+    #             QueryString=drop_table_query,
+    #             QueryExecutionContext={'Database': ATHENA_DATABASE},
+    #             ResultConfiguration={'OutputLocation': ATHENA_QUERY_OUTPUT_S3}
+    #         )
+    #         cleanup_exec_id = response['QueryExecutionId']
+    #         logging.info(f"Started cleanup query with Execution ID: {cleanup_exec_id}")
+    #         # Poll for completion, but don't wait too long or fail script if cleanup fails
+    #         cleanup_execution = poll_query_status(athena_client, cleanup_exec_id, 5) # Short timeout
+    #         if cleanup_execution and cleanup_execution['Status']['State'] == 'SUCCEEDED':
+    #              logging.info(f"Successfully dropped temporary table definition.")
+    #         elif cleanup_execution:
+    #              logging.warning(f"Cleanup query finished with status: {cleanup_execution['Status']['State']}. Reason: {cleanup_execution.get('Status', {}).get('StateChangeReason', 'N/A')}")
+    #         else:
+    #              logging.warning(f"Could not confirm status of cleanup query {cleanup_exec_id}.")
+    #     except Exception as cleanup_err:
+    #         logging.warning(f"Failed to cleanup temporary Athena table definition: {cleanup_err}")
+
+
+if __name__ == "__main__":
+    main()
+    logging.info("Script finished.")
