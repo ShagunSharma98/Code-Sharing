@@ -1,0 +1,146 @@
+import awswrangler as wr
+import logging
+import time
+import boto3 # Optional: for session configuration
+
+# --- Configuration ---
+AWS_REGION = "us-east-1" # Or your region
+ATHENA_DATABASE = "your_athena_database"
+
+# Define your potentially complex SELECT query (NO 'CREATE TABLE' or 'UNLOAD' keywords here)
+SQL_QUERY_SELECT_PART = """
+SELECT
+    column_a,
+    column_b,
+    CAST(column_c AS DATE) as date_c, -- Example transformation
+    SUM(metric_1) as total_metric
+FROM
+    your_source_table t1
+JOIN
+    another_table t2 ON t1.id = t2.id
+WHERE
+    t1.date_partition >= '2023-01-01'
+    AND t2.status = 'ACTIVE'
+    AND t1.some_value > 100
+GROUP BY
+    column_a, column_b, CAST(column_c AS DATE)
+HAVING
+    SUM(metric_1) > 0
+""" # Replace with your actual query logic
+
+# S3 path where the FINAL Parquet data files will be written by UNLOAD
+# MUST end with a '/'
+TARGET_S3_PATH = "s3://your-output-data-bucket/unloaded_data/"
+
+# S3 path for Athena's intermediate query results/metadata (REQUIRED by Athena)
+# MUST end with a '/'
+ATHENA_STAGING_DIR = "s3://your-athena-staging-bucket/query_results/"
+
+# Setup logging
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+
+# --- Optional: Configure boto3 session ---
+# boto3_session = boto3.Session(profile_name="your-profile", region_name=AWS_REGION)
+# wr.config.boto3_session = boto3_session
+
+def extract_data_via_unload():
+    """
+    Extracts data using Athena UNLOAD and awswrangler, writing Parquet to S3.
+    Returns the S3 path where data was written.
+    """
+    logging.info(f"Starting UNLOAD extraction to: {TARGET_S3_PATH}")
+
+    try:
+        # Use wr.athena.unload() - it constructs the UNLOAD statement internally.
+        # Pass the SELECT query part, target path, format, etc.
+        response = wr.athena.unload(
+            sql=SQL_QUERY_SELECT_PART,
+            path=TARGET_S3_PATH, # Where the final Parquet data goes
+            file_format="PARQUET",
+            compression="SNAPPY", # Or GZIP, ZSTD
+            database=ATHENA_DATABASE,
+            s3_output=ATHENA_STAGING_DIR, # Where Athena query metadata goes
+            wait=True # Wait for the query to complete (default)
+            # Add partitioning here if desired:
+            # partition_cols=['year', 'month'] # Ensure these cols are in SELECT
+            # workgroup='your_workgroup' # Specify if not using default
+        )
+
+        # unload() returns a dictionary with query execution details
+        query_execution_id = response.get('QueryExecutionId', 'N/A')
+        query_info = wr.athena.get_query_execution(query_execution_id=query_execution_id) # Get full details if needed
+
+        status = query_info.get('Status', {}).get('State', 'UNKNOWN')
+
+        if status == 'SUCCEEDED':
+            stats = query_info.get('Statistics', {})
+            # Note: UNLOAD might not report DataScannedInBytes as accurately as SELECT/CTAS sometimes
+            logging.info(f"UNLOAD Query {query_execution_id} SUCCEEDED.")
+            logging.info(f"Data written to: {TARGET_S3_PATH}")
+            logging.info(f"Stats: {stats}")
+            return TARGET_S3_PATH # Return the path for downstream use
+        else:
+            reason = query_info.get('Status', {}).get('StateChangeReason', 'N/A')
+            logging.error(f"UNLOAD Query {query_execution_id} failed. Status: {status}, Reason: {reason}")
+            raise RuntimeError(f"Athena UNLOAD query {query_execution_id} failed: {status}")
+
+    except Exception as e:
+        logging.exception(f"Error during Athena UNLOAD execution: {e}")
+        raise # Re-raise the exception
+
+    # --- NO TABLE CLEANUP NEEDED FOR UNLOAD ---
+
+def process_extracted_data(s3_data_path):
+    """
+    Placeholder function demonstrating how to process the data scalably AFTER
+    it has been written to S3 by UNLOAD. (Identical to the CTAS example's processing part)
+    """
+    logging.info(f"\n--- Processing data from: {s3_data_path} ---")
+
+    # Option 1: Process in chunks using Pandas/Wrangler (for single-node processing)
+    logging.info("Processing data using chunking...")
+    total_rows = 0
+    try:
+        # Use chunked=True for memory efficiency
+        for i, chunk_df in enumerate(wr.s3.read_parquet(path=s3_data_path, chunked=True)):
+            logging.info(f"Processing chunk {i} with {len(chunk_df)} rows...")
+            # --- Your processing logic per chunk ---
+            # print(f"First 2 rows of chunk {i}:\n{chunk_df.head(2)}")
+            # ----------------------------------------
+            total_rows += len(chunk_df)
+        logging.info(f"Finished processing {total_rows} rows via chunking.")
+
+    except Exception as e:
+        logging.exception(f"Error processing data in chunks: {e}")
+
+
+    # Option 2: Use a distributed framework like Dask (requires dask library)
+    # logging.info("Processing data using Dask...")
+    # try:
+    #     import dask.dataframe as dd
+    #     ddf = dd.read_parquet(s3_data_path)
+    #     logging.info(f"Dask DataFrame partitions: {ddf.npartitions}")
+    #     # --- Your Dask processing logic ---
+    #     row_count = len(ddf)
+    #     logging.info(f"Total rows calculated by Dask: {row_count}")
+    #     # ----------------------------------
+    # except ImportError:
+    #     logging.warning("Dask is not installed. Skipping Dask processing example.")
+    # except Exception as e:
+    #     logging.exception(f"Error processing data with Dask: {e}")
+
+# --- Main Execution Flow ---
+if __name__ == "__main__":
+    try:
+        # 1. Extract data using UNLOAD -> S3 Parquet
+        output_path = extract_data_via_unload()
+
+        # 2. Process the data from S3 (scalably)
+        if output_path:
+            process_extracted_data(output_path)
+
+        logging.info("Script finished successfully.")
+
+    except Exception as main_err:
+        logging.error(f"Script failed: {main_err}")
+        # Exit with non-zero status? sys.exit(1)
