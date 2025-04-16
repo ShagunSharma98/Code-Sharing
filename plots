@@ -1,0 +1,570 @@
+Okay, let's enhance the previous functions by adding optional plotting capabilities using Seaborn, which is built on Matplotlib and generally provides more statistically oriented plots with simpler syntax, making it a robust and relatively easy-to-use choice for these kinds of tasks.
+
+We'll add a plot_type argument to the relevant functions. When specified, the function will generate and display a plot in addition to returning the data structure.
+
+Necessary Imports:
+
+import pandas as pd
+import numpy as np
+from scipy import stats
+from collections import defaultdict
+import matplotlib.pyplot as plt # Needed for showing/customizing plots
+import seaborn as sns       # For creating the plots
+
+# Set a default style for nicer plots
+sns.set_theme(style="whitegrid")
+
+
+1. py_freq with Plotting
+
+We can add bar plots for 1-way frequencies and heatmaps or bar plots for 2-way tables.
+
+def py_freq(df: pd.DataFrame,
+            tables_vars: list,
+            by_vars: list = None,
+            weight_var: str = None,
+            output_type: str = 'counts',
+            calculate_chi2: bool = False,
+            missing: bool = False,
+            plot_type: str = None # Added: e.g., 'bar' (1-way), 'heatmap', 'stacked_bar', 'grouped_bar' (2-way)
+           ):
+    """
+    Replicates basic SAS PROC FREQ functionality for 1-way and 2-way tables,
+    with optional plotting using Seaborn.
+
+    Args:
+        df (pd.DataFrame): Input DataFrame.
+        tables_vars (list): List of 1 or 2 variable names (strings) for the table.
+        by_vars (list, optional): List of variable names to group by. Defaults to None.
+        weight_var (str, optional): Variable name for weights. Defaults to None.
+        output_type (str): Type of output for 2-way tables ('counts', 'percent', etc.). Defaults to 'counts'.
+        calculate_chi2 (bool): If True and 2-way, calculate Chi-Square. Defaults to False.
+        missing (bool): If True, include NaN values in frequency counts. Defaults to False.
+        plot_type (str, optional): Type of plot to generate.
+                                   For 1-way: 'bar' (frequency or weighted sum).
+                                   For 2-way: 'heatmap', 'stacked_bar', 'grouped_bar'.
+                                   Defaults to None (no plot).
+
+    Returns:
+        dict: A dictionary where keys are tuples representing the 'BY' group (or ('All',))
+              and values are the frequency/crosstab DataFrames or a tuple (DataFrame, chi2_results).
+              Plots are displayed as a side effect if plot_type is specified.
+    """
+    results = {}
+    dropna_val = not missing
+
+    if not isinstance(tables_vars, list) or not (1 <= len(tables_vars) <= 2):
+        raise ValueError("`tables_vars` must be a list containing 1 or 2 variable names.")
+    # --- Input validation (as before) ---
+    if weight_var and weight_var not in df.columns:
+         raise ValueError(f"Weight variable '{weight_var}' not found in DataFrame.")
+    for var in tables_vars:
+        if var not in df.columns:
+            raise ValueError(f"Table variable '{var}' not found in DataFrame.")
+    if by_vars:
+        for var in by_vars:
+            if var not in df.columns:
+                raise ValueError(f"BY variable '{var}' not found in DataFrame.")
+        grouped = df.groupby(by_vars, dropna=False)
+    else:
+        grouped = [('All', df)]
+
+    for name, group_df in grouped:
+        if group_df.empty:
+            results[name] = pd.DataFrame()
+            continue
+
+        current_df = group_df.copy()
+        weights = current_df[weight_var] if weight_var else None
+        group_title_suffix = f" (Group: {name})" if name != 'All' else ""
+
+        # --- One-Way Frequency ---
+        if len(tables_vars) == 1:
+            var1 = tables_vars[0]
+            if weights is not None:
+                 counts = current_df.groupby(var1, dropna=dropna_val)[weight_var].sum()
+                 plot_y_label = f"Sum of {weight_var}"
+            else:
+                 counts = current_df[var1].value_counts(dropna=dropna_val)
+                 plot_y_label = "Frequency"
+
+            if counts.empty:
+                freq_table = pd.DataFrame(columns=['Frequency', 'Percent', 'Cumulative Frequency', 'Cumulative Percent'])
+                results[name] = freq_table
+                if plot_type: print(f"Skipping plot for group {name}: No data.")
+                continue
+
+            total_n = counts.sum()
+            freq_table = pd.DataFrame({
+                'Frequency': counts,
+                'Percent': (counts / total_n * 100) if total_n else 0,
+                'Cumulative Frequency': counts.cumsum(),
+                'Cumulative Percent': (counts.cumsum() / total_n * 100) if total_n else 0
+            })
+            freq_table.index.name = var1
+            results[name] = freq_table
+
+            # --- Plotting (1-Way) ---
+            if plot_type == 'bar':
+                plt.figure(figsize=(8, 5))
+                plot_data = freq_table.reset_index()
+                sns.barplot(x=var1, y='Frequency', data=plot_data)
+                plt.title(f"Frequency Distribution of {var1}{group_title_suffix}")
+                plt.ylabel(plot_y_label)
+                plt.xticks(rotation=45, ha='right')
+                plt.tight_layout()
+                plt.show()
+
+        # --- Two-Way Crosstabulation ---
+        elif len(tables_vars) == 2:
+            var1, var2 = tables_vars[0], tables_vars[1]
+
+            try:
+                counts_table = pd.crosstab(index=current_df[var1],
+                                           columns=current_df[var2],
+                                           values=weights,
+                                           aggfunc='sum' if weights is not None else None,
+                                           dropna=dropna_val,
+                                           margins=True, margins_name='Total')
+            except Exception as e:
+                 print(f"Warning: Could not create crosstab for group {name}. Error: {e}")
+                 results[name] = pd.DataFrame()
+                 if plot_type: print(f"Skipping plot for group {name}: Crosstab error.")
+                 continue
+
+            if counts_table.shape == (1,1): # Only 'Total' row/col means no data
+                 results[name] = counts_table # Return empty table with margins
+                 if plot_type: print(f"Skipping plot for group {name}: No data in crosstab.")
+                 continue
+
+
+            # --- Calculate percentages (as before) ---
+            total = counts_table.loc['Total', 'Total']
+            percent_table = (counts_table / total * 100) if total else counts_table * np.nan
+            row_percent_table = counts_table.apply(lambda x: x / x['Total'] * 100 if x['Total'] else x * np.nan, axis=1)
+            col_percent_table = counts_table.apply(lambda x: x / x['Total'] * 100 if x['Total'] else x * np.nan, axis=0)
+            # ... (rest of the percentage logic as before) ...
+            output_tables = {'counts': counts_table}
+            if output_type in ['percent', 'all']: output_tables['percent'] = percent_table
+            if output_type in ['row_percent', 'all']: output_tables['row_percent'] = row_percent_table
+            if output_type in ['col_percent', 'all']: output_tables['col_percent'] = col_percent_table
+
+            if output_type == 'all': final_table = output_tables
+            elif output_type in output_tables: final_table = output_tables[output_type]
+            else: final_table = counts_table
+
+            # --- Chi-Square (as before) ---
+            chi2_results = None
+            if calculate_chi2:
+                # ... (chi2 calculation logic as before) ...
+                 contingency_table = counts_table.drop('Total', axis=0).drop('Total', axis=1)
+                 if contingency_table.shape == (0,0): chi2_results = "Chi2: Cannot compute on empty table"
+                 elif 0 in contingency_table.sum(axis=0).values or 0 in contingency_table.sum(axis=1).values: chi2_results = "Chi2: Cannot compute with zero row/column sums"
+                 else:
+                    try:
+                        chi2, p, dof, expected = stats.chi2_contingency(contingency_table)
+                        chi2_results = {'Chi-Square': chi2, 'p-value': p, 'DoF': dof}
+                    except ValueError as ve: chi2_results = f"Chi2: Error during calculation - {ve}"
+
+
+            # Store results
+            if calculate_chi2: results[name] = (final_table, chi2_results)
+            else: results[name] = final_table
+
+            # --- Plotting (2-Way) ---
+            plot_table = counts_table.drop('Total', axis=0).drop('Total', axis=1) # Use counts without margins for plots
+            if not plot_table.empty:
+                if plot_type == 'heatmap':
+                    plt.figure(figsize=(8, 6))
+                    sns.heatmap(plot_table, annot=True, fmt=".0f", cmap="viridis", linewidths=.5) # fmt='d' for integer counts
+                    plt.title(f"Crosstabulation: {var1} vs {var2}{group_title_suffix}")
+                    plt.tight_layout()
+                    plt.show()
+                elif plot_type in ['stacked_bar', 'grouped_bar']:
+                    # Reshape for seaborn barplot
+                    plot_data = plot_table.stack().reset_index()
+                    plot_data.columns = [var1, var2, 'Count'] # Rename columns
+
+                    plt.figure(figsize=(10, 6))
+                    if plot_type == 'stacked_bar':
+                         # Stacked bar needs careful pivot or iterative plotting in seaborn
+                         # Easier approach: use pandas plotting directly
+                         try:
+                             plot_table.plot(kind='bar', stacked=True, figsize=(10, 6))
+                             plt.title(f"Stacked Bar Chart: {var1} vs {var2}{group_title_suffix}")
+                             plt.ylabel("Count" if weight_var is None else f"Sum of {weight_var}")
+                             plt.xticks(rotation=0)
+                             plt.legend(title=var2)
+                             plt.tight_layout()
+                             plt.show()
+                         except TypeError as e:
+                              print(f"Could not generate stacked bar plot for group {name}: {e}")
+
+                    elif plot_type == 'grouped_bar':
+                        sns.barplot(x=var1, y='Count', hue=var2, data=plot_data)
+                        plt.title(f"Grouped Bar Chart: {var1} vs {var2}{group_title_suffix}")
+                        plt.ylabel("Count" if weight_var is None else f"Sum of {weight_var}")
+                        plt.xticks(rotation=0)
+                        plt.tight_layout()
+                        plt.show()
+            elif plot_type:
+                 print(f"Skipping plot for group {name}: No data after removing margins.")
+
+
+    return results
+
+# --- Example Usage for py_freq with plotting ---
+data_freq = {
+    'Gender': ['M', 'F', 'M', 'F', 'M', 'F', 'M', 'F', 'M', np.nan, 'F', 'M'],
+    'Region': ['North', 'North', 'South', 'South', 'East', 'East', 'West', 'West', 'North', 'South', 'East', 'West'],
+    'Vote': ['Yes', 'No', 'Yes', 'Yes', 'No', 'No', 'Yes', 'No', 'Yes', 'No', 'Yes', 'Yes'],
+    'Weight': [1.0, 1.5, 0.8, 1.2, 1.0, 1.0, 0.9, 1.1, 1.3, 0.7, 1.0, 1.0]
+}
+df_freq = pd.DataFrame(data_freq)
+
+print("\n--- py_freq: One-Way Frequency (Region) with Bar Plot ---")
+freq_region_plot = py_freq(df_freq, tables_vars=['Region'], plot_type='bar')
+# print(freq_region_plot['All']) # Display table if needed
+
+print("\n--- py_freq: Two-Way Crosstab (Gender * Region) with Heatmap ---")
+crosstab_gr_plot = py_freq(df_freq, tables_vars=['Gender', 'Region'], plot_type='heatmap')
+# print(crosstab_gr_plot['All']) # Display table if needed
+
+print("\n--- py_freq: Two-Way Crosstab (Vote * Region) BY Gender with Grouped Bar Plots ---")
+crosstab_vr_by_g_plot = py_freq(df_freq, tables_vars=['Vote', 'Region'], by_vars=['Gender'], plot_type='grouped_bar')
+# for group, table in crosstab_vr_by_g_plot.items(): # Display tables if needed
+#     print(f"\nBY Group: Gender={group}")
+#     print(table)
+IGNORE_WHEN_COPYING_START
+content_copy
+download
+Use code with caution.
+Python
+IGNORE_WHEN_COPYING_END
+
+2. py_means with Plotting
+
+Plotting aggregated results (like means) across groups is common. We'll add a simple bar chart option.
+
+def py_means(df: pd.DataFrame,
+             var_vars: list,
+             class_vars: list = None,
+             stats_list: list = None,
+             weight_var: str = None,
+             print_output: bool = True,
+             plot_type: str = None # Added: e.g., 'bar'
+            ):
+    """
+    Replicates basic SAS PROC MEANS/SUMMARY functionality, with optional plotting.
+
+    Args:
+        df (pd.DataFrame): Input DataFrame.
+        var_vars (list): List of numeric variable names for analysis.
+        class_vars (list, optional): List of categorical variable names for grouping. Defaults to None.
+        stats_list (list, optional): List of statistics to compute. Defaults to ['n', 'mean', 'std', 'min', 'max'].
+        weight_var (str, optional): Variable name for weights. Defaults to None.
+        print_output (bool): If True, print the results table. Defaults to True.
+        plot_type (str, optional): Type of plot. Currently supports 'bar' for grouped data.
+                                   Plots the *first* statistic listed in stats_list for the
+                                   *first* variable in var_vars across the groups.
+                                   Defaults to None.
+
+    Returns:
+        pd.DataFrame: DataFrame containing the calculated statistics.
+                      Plots are displayed as a side effect if plot_type is specified.
+    """
+    if stats_list is None:
+        stats_list = ['n', 'mean', 'std', 'min', 'max']
+
+    # --- Input validation and Stat Definitions (as before) ---
+    # ... (validation code) ...
+    # ... (weighted function definitions) ...
+    # ... (stat_map definition) ...
+    # ... (weighted quantile warning) ...
+
+    selected_agg_funcs = {stat: stat_map[stat] for stat in stats_list if stat in stat_map}
+    if not selected_agg_funcs:
+         raise ValueError("No valid statistics selected.")
+
+    # --- Perform aggregation (as before) ---
+    if class_vars:
+        grouped = df.groupby(class_vars, dropna=False)
+        results_df = grouped[var_vars].agg(selected_agg_funcs)
+        # Flatten MultiIndex columns if they exist
+        if isinstance(results_df.columns, pd.MultiIndex):
+             results_df.columns = ['_'.join(col).strip() for col in results_df.columns.values]
+        results_df = results_df.reset_index() # Make class_vars regular columns for plotting
+
+    else: # No grouping
+        results_series = df[var_vars].agg(selected_agg_funcs)
+        results_df = pd.DataFrame(results_series)
+        if len(var_vars) == 1 and isinstance(results_df.columns, pd.RangeIndex):
+             results_df.columns = [f"{var_vars[0]}_{stat}" for stat in results_df.index]
+             results_df = results_df.T
+        # Add a dummy column for potential plotting consistency if needed later
+        # results_df['_Overall_'] = 'Overall' # Optional
+
+    if print_output:
+        print(results_df)
+
+    # --- Plotting ---
+    if plot_type == 'bar' and class_vars:
+        if not results_df.empty:
+            # Plot the first statistic for the first analysis variable
+            first_var = var_vars[0]
+            first_stat = stats_list[0]
+            # Construct the column name (handling potential flattening)
+            plot_col_name = f"{first_var}_{first_stat}"
+            if plot_col_name not in results_df.columns:
+                 # Maybe it wasn't flattened (single stat/var)? Try direct names
+                 if first_stat in results_df.columns and len(var_vars)==1:
+                     plot_col_name = first_stat
+                 elif first_var in results_df.columns and len(stats_list)==1:
+                      plot_col_name = first_var
+                 else:
+                      print(f"Warning: Could not find column '{plot_col_name}' or suitable alternative for plotting.")
+                      plot_col_name = None # Skip plotting
+
+
+            if plot_col_name:
+                plt.figure(figsize=(10, 6))
+                if len(class_vars) == 1:
+                    sns.barplot(x=class_vars[0], y=plot_col_name, data=results_df)
+                    plt.title(f"{plot_col_name.replace('_', ' ').title()} by {class_vars[0]}")
+                elif len(class_vars) == 2:
+                    # Use hue for the second class variable
+                    sns.barplot(x=class_vars[0], y=plot_col_name, hue=class_vars[1], data=results_df)
+                    plt.title(f"{plot_col_name.replace('_', ' ').title()} by {class_vars[0]} and {class_vars[1]}")
+                    plt.legend(title=class_vars[1], bbox_to_anchor=(1.05, 1), loc='upper left')
+                else: # More than 2 class vars - just plot against the first one
+                     print("Warning: Plotting only against the first class variable for >2 class variables.")
+                     sns.barplot(x=class_vars[0], y=plot_col_name, data=results_df)
+                     plt.title(f"{plot_col_name.replace('_', ' ').title()} by {class_vars[0]}")
+
+                plt.ylabel(plot_col_name.replace('_', ' ').title())
+                plt.xticks(rotation=45, ha='right')
+                plt.tight_layout()
+                plt.show()
+        else:
+            print("Skipping plot: Result DataFrame is empty.")
+
+    elif plot_type and not class_vars:
+        print("Warning: Bar plot currently only supported for grouped data (with class_vars).")
+    elif plot_type:
+         print(f"Warning: Plot type '{plot_type}' not currently supported in py_means.")
+
+
+    return results_df
+
+# --- Example Usage for py_means with plotting ---
+data_means = {
+    'Group': ['A', 'A', 'B', 'B', 'A', 'B', 'A', 'B', 'A', 'A'],
+    'SubGroup': ['X', 'Y', 'X', 'Y', 'X', 'Y', 'X', 'X', 'Y', 'Y'],
+    'Value1': [10, 12, 15, 18, 11, 16, 13, 14, 12, 10],
+    'Value2': [100, 110, 150, 130, 105, 145, 115, 125, 112, 108],
+    'Weight': [1.0, 0.5, 1.2, 0.8, 1.0, 0.7, 1.1, 0.9, 1.3, 1.0]
+}
+df_means = pd.DataFrame(data_means)
+
+print("\n--- py_means: Mean Value1 by Group, SubGroup with Bar Plot ---")
+# Note: Will plot 'n' (first stat) for 'Value1' (first var)
+means_complex_grouped_plot = py_means(df_means,
+                                      var_vars=['Value1', 'Value2'],
+                                      class_vars=['Group', 'SubGroup'],
+                                      stats_list=['n', 'mean', 'std'], # Will plot 'n'
+                                      plot_type='bar')
+
+print("\n--- py_means: Mean Value2 by Group with Bar Plot ---")
+# Will plot 'mean' (first stat) for 'Value2' (first var)
+means_v2_plot = py_means(df_means,
+                         var_vars=['Value2'],
+                         class_vars=['Group'],
+                         stats_list=['mean', 'std'], # Will plot 'mean'
+                         plot_type='bar')
+IGNORE_WHEN_COPYING_START
+content_copy
+download
+Use code with caution.
+Python
+IGNORE_WHEN_COPYING_END
+
+3. py_univariate with Plotting
+
+This is ideal for histograms and box plots to visualize distributions.
+
+def py_univariate(df: pd.DataFrame,
+                  var_vars: list,
+                  by_vars: list = None,
+                  quantiles: list = None,
+                  n_extreme: int = 5,
+                  test_normality: bool = True,
+                  print_output: bool = True,
+                  plot_type: str = None # Added: e.g., 'hist', 'box', 'hist+kde', 'box+swarm'
+                 ):
+    """
+    Replicates some core SAS PROC UNIVARIATE functionality, with optional plotting.
+
+    Args:
+        df (pd.DataFrame): Input DataFrame.
+        var_vars (list): List of numeric variable names for analysis.
+        by_vars (list, optional): List of variable names to group by. Defaults to None.
+        quantiles (list, optional): List of quantiles to compute. Defaults to standard set.
+        n_extreme (int): Number of lowest/highest observations. Defaults to 5.
+        test_normality (bool): If True, perform Shapiro-Wilk test. Defaults to True.
+        print_output (bool): If True, print the results. Defaults to True.
+        plot_type (str, optional): Type of plot to generate for each variable/group.
+                                   Options: 'hist' (histogram), 'hist+kde' (histogram with density),
+                                   'box' (box plot), 'box+swarm' (boxplot with points).
+                                   Defaults to None.
+
+    Returns:
+        dict: A nested dictionary containing the detailed statistics.
+              Plots are displayed as a side effect if plot_type is specified.
+    """
+    if quantiles is None:
+        quantiles = [0.01, 0.05, 0.1, 0.25, 0.5, 0.75, 0.9, 0.95, 0.99]
+
+    # --- Input validation (as before) ---
+    # ... (validation code) ...
+
+    if by_vars:
+        grouped = df.groupby(by_vars, dropna=False)
+    else:
+        grouped = [('All', df)]
+
+    all_results = defaultdict(dict)
+
+    for name, group_df in grouped:
+        if group_df.empty:
+            all_results[name] = "No data in this group"
+            continue
+
+        group_results = defaultdict(dict)
+        group_title_suffix = f" (Group: {name})" if name != 'All' else ""
+
+        for var in var_vars:
+            # --- Data extraction and validation (as before) ---
+            var_data = group_df[var].dropna()
+            if len(var_data) < 1: # Need at least 1 for basic plots
+                 group_results[var] = f"Insufficient non-missing data for variable '{var}' (N={len(var_data)})"
+                 if plot_type: print(f"Skipping plot for {var} in group {name}: No non-missing data.")
+                 continue
+            elif len(var_data) < 3 and test_normality:
+                 print(f"Warning: Normality test requires N>=3 for {var} in group {name}.")
+
+
+            var_results = {}
+            # --- Moments, Measures, Quantiles, Extremes, Normality (as before) ---
+            # ... (calculation code remains the same) ...
+            desc = var_data.describe()
+            moments = { ... } # Calculate moments
+            var_results['Moments'] = pd.Series(moments)
+            measures = { ... } # Calculate measures
+            var_results['Basic Measures'] = pd.Series(measures)
+            q_values = var_data.quantile(quantiles) # Calculate quantiles
+            # ... format q_values ...
+            var_results['Quantiles'] = q_values
+            # ... calculate extreme obs ...
+            var_results['Extreme Observations'] = extreme_obs # Or message
+            if test_normality:
+                 # ... calculate normality ...
+                 var_results['Normality Test (Shapiro-Wilk)'] = { ... } # Or message
+
+
+            # --- Plotting ---
+            if plot_type:
+                plt.figure(figsize=(8, 5))
+                plot_title = f"{var}{group_title_suffix}"
+
+                if plot_type == 'hist':
+                    sns.histplot(var_data, bins='auto') # Auto-determine bins
+                    plt.title(f"Histogram of {plot_title}")
+                elif plot_type == 'hist+kde':
+                    sns.histplot(var_data, kde=True, bins='auto')
+                    plt.title(f"Histogram with Density Curve of {plot_title}")
+                elif plot_type == 'box':
+                    sns.boxplot(y=var_data)
+                    plt.title(f"Box Plot of {plot_title}")
+                    plt.ylabel(var) # Label the axis
+                elif plot_type == 'box+swarm':
+                    if len(var_data) < 500: # Swarmplot can be slow for large N
+                        sns.boxplot(y=var_data, showfliers=False) # Hide boxplot outliers if showing swarm
+                        sns.swarmplot(y=var_data, color=".25", size=4)
+                        plt.title(f"Box Plot with Swarm Plot of {plot_title}")
+                        plt.ylabel(var)
+                    else:
+                        print(f"Skipping swarm plot for {var} in group {name}: N ({len(var_data)}) too large.")
+                        # Fallback to regular boxplot
+                        sns.boxplot(y=var_data)
+                        plt.title(f"Box Plot of {plot_title} (Swarm skipped N>=500)")
+                        plt.ylabel(var)
+                else:
+                    print(f"Warning: Unsupported plot_type '{plot_type}' for py_univariate.")
+
+                if plot_type in ['hist', 'hist+kde', 'box', 'box+swarm']:
+                    plt.tight_layout()
+                    plt.show()
+
+
+            group_results[var] = var_results
+        all_results[name] = dict(group_results)
+
+    # --- Printing Output (as before) ---
+    if print_output:
+        # ... (printing logic remains the same) ...
+        for group_name, group_data in all_results.items():
+            print(f"\n{'='*20} Analysis for BY Group: {group_name} {'='*20}")
+            if isinstance(group_data, str): print(group_data); continue
+            for var_name, var_stats in group_data.items():
+                 print(f"\n--- Variable: {var_name} ---")
+                 if isinstance(var_stats, str): print(var_stats); continue
+                 for section_name, section_data in var_stats.items():
+                     print(f"\n{section_name}:")
+                     # ... (rest of printing) ...
+
+
+    return dict(all_results)
+
+
+# --- Example Usage for py_univariate with plotting ---
+print("\n--- py_univariate: Detailed Stats & Plots (Value1) ---")
+univar_v1_plots = py_univariate(df_means, var_vars=['Value1'], plot_type='hist+kde')
+
+print("\n--- py_univariate: Detailed Stats & Plots (Value2) by Group ---")
+univar_v2_grouped_plots = py_univariate(df_means,
+                                        var_vars=['Value2'],
+                                        by_vars=['Group'],
+                                        plot_type='box+swarm',
+                                        print_output=False) # Suppress text output for brevity
+IGNORE_WHEN_COPYING_START
+content_copy
+download
+Use code with caution.
+Python
+IGNORE_WHEN_COPYING_END
+
+Notes on Plotting Integration:
+
+Seaborn & Matplotlib: Seaborn is used for creating the plots, but matplotlib.pyplot (as plt) is still needed for functions like plt.show(), plt.figure(), plt.title(), plt.xlabel(), plt.ylabel(), plt.xticks(), plt.tight_layout().
+
+Side Effects: The plots are generated and displayed during the function execution (a side effect). The functions still return the primary data structures (dictionaries or DataFrames).
+
+Plotting Granularity:
+
+py_freq and py_univariate: Plots are generated for each variable/group combination processed within the by_vars loop (if applicable).
+
+py_means: The plot is generated after the final aggregated DataFrame is created. It attempts to plot the first requested statistic for the first analysis variable across the specified groups.
+
+Customization: These plots use Seaborn defaults. You could add many more arguments to the Seaborn/Matplotlib functions (e.g., palette, order, specific ax objects for subplots) for further customization if needed.
+
+Limitations:
+
+py_means plotting is basic, focusing on comparing a single statistic across groups using bar charts. Visualizing multiple stats or variables simultaneously would require more complex plotting logic (e.g., faceted plots with sns.catplot).
+
+py_freq stacked bar plot uses pandas plotting as a simpler alternative to complex Seaborn reshaping for this specific plot type.
+
+Error handling for plotting is minimal; more robust code might catch specific plotting errors.
+
+Swarm plots in py_univariate are skipped for large N to avoid performance issues.
+
+This integration provides visual insights directly alongside the numerical summaries, making the functions more powerful for exploratory data analysis.
