@@ -404,4 +404,410 @@ except ValueError as e:
 print("\n--- Example 7: Single Variable, Overall Stats ---")
 res7 = py_means(df_means_example,
                 var_vars=['Value1'],
+                stats_list=['n', 'mean', 'std'])import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+import seaborn as sns
+
+# Set a default plotting style
+sns.set_theme(style="whitegrid")
+
+def py_means(
+    df: pd.DataFrame,
+    var_vars: list,
+    class_vars: list = None,
+    stats_list: list = None,
+    weight_var: str = None,
+    print_output: bool = True,
+    plot_type: str = None
+    ):
+    """
+    Calculates descriptive statistics for numeric variables, similar to SAS PROC MEANS/SUMMARY.
+
+    Args:
+        df (pd.DataFrame): The input pandas DataFrame.
+        var_vars (list): A list of numeric column names (strings) to analyze (like SAS VAR).
+        class_vars (list, optional): A list of categorical column names (strings) to group by
+                                     (like SAS CLASS). Defaults to None (no grouping).
+        stats_list (list, optional): A list of statistic names (strings) to compute.
+                                     Supported: 'n', 'mean', 'std', 'min', 'max', 'sum',
+                                     'median', 'q1' (25th), 'q3' (75th), 'range', 'var',
+                                     'sem' (Std Error of Mean), 'uss' (Uncorrected SS),
+                                     'css' (Corrected SS), 'cv' (Coefficient of Variation %).
+                                     Defaults to ['n', 'mean', 'std', 'min', 'max'] if None.
+        weight_var (str, optional): The column name (string) containing weights
+                                    (like SAS WEIGHT). Defaults to None.
+        print_output (bool): If True, prints the resulting statistics DataFrame to the console.
+                             Defaults to True.
+        plot_type (str, optional): If specified, generates a plot. Currently supports 'bar'
+                                   for grouped data (when class_vars is provided). Plots the
+                                   first statistic in stats_list for the first variable in
+                                   var_vars across the groups. Defaults to None.
+
+    Returns:
+        pd.DataFrame: A DataFrame containing the calculated statistics. The structure depends
+                      on whether class_vars were provided. Plots are shown as a side effect
+                      if plot_type is specified.
+
+    Raises:
+        ValueError: If input arguments are invalid (e.g., columns not found, non-numeric weights).
+        TypeError: If df is not a pandas DataFrame.
+    """
+
+    # --- 1. Input Validation ---
+    if not isinstance(df, pd.DataFrame):
+        raise TypeError("Input 'df' must be a pandas DataFrame.")
+
+    if not isinstance(var_vars, list) or not var_vars:
+        raise ValueError("'var_vars' must be a non-empty list of column names.")
+    for var in var_vars:
+        if var not in df.columns:
+            raise ValueError(f"Analysis variable '{var}' not found in DataFrame columns.")
+        if not pd.api.types.is_numeric_dtype(df[var]):
+            print(f"Warning: Analysis variable '{var}' is not numeric. Statistics might be meaningless.")
+
+    if class_vars:
+        if not isinstance(class_vars, list):
+            raise ValueError("'class_vars' must be a list of column names or None.")
+        for cvar in class_vars:
+            if cvar not in df.columns:
+                raise ValueError(f"Class variable '{cvar}' not found in DataFrame columns.")
+
+    if weight_var:
+        if weight_var not in df.columns:
+            raise ValueError(f"Weight variable '{weight_var}' not found in DataFrame columns.")
+        if not pd.api.types.is_numeric_dtype(df[weight_var]):
+            raise ValueError(f"Weight variable '{weight_var}' must be numeric.")
+        if (df[weight_var] < 0).any():
+            print(f"Warning: Weight variable '{weight_var}' contains negative values.")
+
+    # Set default statistics if none provided
+    if stats_list is None:
+        stats_list = ['n', 'mean', 'std', 'min', 'max']
+    elif not isinstance(stats_list, list):
+         raise ValueError("'stats_list' must be a list of statistic names or None.")
+
+    # --- 2. Setup Weights and Helper Functions ---
+    weighted_mode = (weight_var is not None)
+    weights = df[weight_var].copy() if weighted_mode else None # Use .copy() to avoid SettingWithCopyWarning later if needed
+
+    # Define calculation functions (handle weighted vs unweighted)
+    def _get_n(x):
+        return len(x.dropna()) # Count non-missing values
+
+    def _get_n_weighted(x):
+        valid_indices = x.dropna().index
+        return weights.loc[valid_indices].sum() if weighted_mode else len(valid_indices)
+
+    def _get_mean(x):
+        return x.mean()
+
+    def _get_mean_weighted(x):
+        valid_indices = x.dropna().index
+        if weighted_mode:
+            w = weights.loc[valid_indices]
+            sum_w = w.sum()
+            return np.average(x.loc[valid_indices], weights=w) if sum_w > 0 else np.nan
+        else:
+            return x.mean()
+
+    def _get_std(x):
+        return x.std()
+
+    def _get_std_weighted(x):
+        valid_indices = x.dropna().index
+        if not weighted_mode:
+            return x.std()
+        else:
+            w = weights.loc[valid_indices]
+            w_mean = _get_mean_weighted(x) # Use the correct weighted mean
+            sum_w = w.sum()
+            if sum_w <= 1 or pd.isna(w_mean): # Need sum_w > 1 for unbiased variance
+                 return np.nan
+            # Weighted variance (Bessel's correction n-1 equivalent)
+            variance = ((x.loc[valid_indices] - w_mean)**2 * w).sum() / (sum_w - 1)
+            return np.sqrt(variance) if variance >= 0 else np.nan
+
+    def _get_var(x):
+        return x.var()
+
+    def _get_var_weighted(x):
+         # Reuse weighted std calculation logic
+         std_w = _get_std_weighted(x)
+         return std_w**2 if not pd.isna(std_w) else np.nan
+
+    def _get_sum(x):
+        return x.sum()
+
+    def _get_sum_weighted(x):
+        valid_indices = x.dropna().index
+        return (x.loc[valid_indices] * weights.loc[valid_indices]).sum() if weighted_mode else x.sum()
+
+    def _get_uss(x): # Uncorrected Sum of Squares
+        return (x.dropna()**2).sum()
+
+    def _get_uss_weighted(x):
+        valid_indices = x.dropna().index
+        return ((x.loc[valid_indices]**2) * weights.loc[valid_indices]).sum() if weighted_mode else (x.dropna()**2).sum()
+
+    def _get_css(x): # Corrected Sum of Squares
+        return ((x.dropna() - x.mean())**2).sum()
+
+    def _get_css_weighted(x):
+        valid_indices = x.dropna().index
+        if not weighted_mode:
+            return ((x.dropna() - x.mean())**2).sum()
+        else:
+            w = weights.loc[valid_indices]
+            w_mean = _get_mean_weighted(x)
+            if pd.isna(w_mean): return np.nan
+            return ((x.loc[valid_indices] - w_mean)**2 * w).sum()
+
+    def _get_cv(x): # Coefficient of Variation
+        m = x.mean()
+        s = x.std()
+        return (s / m * 100) if m else np.nan
+
+    def _get_cv_weighted(x):
+        m = _get_mean_weighted(x)
+        s = _get_std_weighted(x)
+        return (s / m * 100) if m and not pd.isna(m) and not pd.isna(s) else np.nan
+
+    def _get_sem(x): # Standard Error of Mean
+        n_val = _get_n(x)
+        return x.std() / np.sqrt(n_val) if n_val > 0 else np.nan
+
+    def _get_sem_weighted(x):
+        # SAS uses unweighted N in the denominator for weighted SEM
+        n_unweighted = _get_n(x)
+        std_w = _get_std_weighted(x)
+        return std_w / np.sqrt(n_unweighted) if n_unweighted > 0 and not pd.isna(std_w) else np.nan
+
+
+    # --- 3. Map Statistic Names to Functions ---
+    stat_map = {
+        # Stat Name : (Unweighted Function/String, Weighted Function)
+        'n':      (_get_n, _get_n_weighted), # Use custom N funcs for clarity
+        'mean':   (_get_mean, _get_mean_weighted),
+        'std':    (_get_std, _get_std_weighted),
+        'min':    ('min', 'min'), # Pandas handles min/max directly
+        'max':    ('max', 'max'),
+        'sum':    (_get_sum, _get_sum_weighted),
+        'median': ('median', 'median'), # No direct weighted median in pandas
+        'q1':     (lambda x: x.quantile(0.25), lambda x: x.quantile(0.25)), # No direct weighted quantile
+        'q3':     (lambda x: x.quantile(0.75), lambda x: x.quantile(0.75)), # No direct weighted quantile
+        'range':  (lambda x: x.max() - x.min(), lambda x: x.max() - x.min()),
+        'var':    (_get_var, _get_var_weighted),
+        'sem':    (_get_sem, _get_sem_weighted),
+        'uss':    (_get_uss, _get_uss_weighted),
+        'css':    (_get_css, _get_css_weighted),
+        'cv':     (_get_cv, _get_cv_weighted),
+    }
+
+    # Warn about unweighted stats if weights are used
+    unsupported_weighted = {'median', 'q1', 'q3'}
+    requested_unsupported = unsupported_weighted.intersection(stats_list)
+    if weighted_mode and requested_unsupported:
+        print(f"Warning: Weights provided, but standard pandas implementation for "
+              f"{list(requested_unsupported)} does not support weights. Unweighted versions used.")
+
+    # Build the dictionary of functions to pass to .agg()
+    agg_funcs_to_run = {}
+    valid_stats_found = False
+    for stat_name in stats_list:
+        if stat_name in stat_map:
+            valid_stats_found = True
+            # Select the correct function (weighted or unweighted)
+            func = stat_map[stat_name][1] if weighted_mode else stat_map[stat_name][0]
+            agg_funcs_to_run[stat_name] = func
+        else:
+            print(f"Warning: Requested statistic '{stat_name}' is not supported and will be skipped.")
+
+    if not valid_stats_found:
+        raise ValueError("No valid statistics were selected to compute.")
+
+
+    # --- 4. Perform Aggregation ---
+    results_df = None
+    if class_vars:
+        # Grouped aggregation
+        grouped = df.groupby(class_vars, dropna=False, observed=False) # dropna=False includes NA groups, observed=False includes all cat levels
+        try:
+            results_df = grouped[var_vars].agg(agg_funcs_to_run)
+        except Exception as e:
+             print(f"Error during aggregation: {e}")
+             raise e # Re-raise the error for now
+
+        # Flatten MultiIndex columns if necessary (e.g., ('Value1', 'mean') -> 'Value1_mean')
+        if isinstance(results_df.columns, pd.MultiIndex):
+            results_df.columns = ['_'.join(map(str, col)).strip() for col in results_df.columns.values]
+
+        results_df = results_df.reset_index() # Turn group keys back into columns
+
+    else:
+        # Aggregation over the entire DataFrame for specified var_vars (NO GROUPING)
+        # --- THIS BLOCK CONTAINS THE FIX ---
+        try:
+            # results_agg will be:
+            # - Series if len(var_vars)==1 (index=stats)
+            # - DataFrame if len(var_vars)>1 (index=stats, columns=vars)
+            results_agg = df[var_vars].agg(agg_funcs_to_run)
+        except Exception as e:
+             print(f"Error during aggregation: {e}")
+             raise e
+
+        # Ensure we start with a DataFrame (index=stats, columns=vars)
+        if isinstance(results_agg, pd.Series):
+            # Convert Series (single var) to DataFrame
+            results_df_temp = pd.DataFrame(results_agg, columns=[var_vars[0]])
+        else:
+            # Already a DataFrame (multiple vars)
+            results_df_temp = pd.DataFrame(results_agg)
+
+        # Stack the DataFrame: moves columns (vars) to become the inner index level
+        # Result is a Series with MultiIndex (statistic, variable)
+        results_stacked = results_df_temp.stack()
+
+        # Create the final DataFrame structure: a single row with combined column names
+        results_df = pd.DataFrame(results_stacked).T
+
+        # Rename the columns from MultiIndex (level_0=statistic, level_1=variable)
+        # to the desired flat format: VarName_StatName
+        # We access the stacked Series' index to get the correct pairs
+        results_df.columns = [f"{idx[1]}_{idx[0]}" for idx in results_stacked.index] # Note: idx[1] is var, idx[0] is stat
+
+        # Set a meaningful index for the overall summary row
+        results_df.index = ['Overall']
+        # --- END OF FIX BLOCK ---
+
+
+    # --- 5. Print Output ---
+    if print_output and results_df is not None:
+        print("\n--- py_means Results ---")
+        # Use to_string() for better console display of potentially wide DataFrames
+        print(results_df.to_string())
+        print("------------------------\n")
+
+
+    # --- 6. Generate Plot ---
+    if plot_type and results_df is not None and not results_df.empty:
+        if plot_type == 'bar':
+            if not class_vars:
+                print("Warning: 'bar' plot type is designed for grouped data (use class_vars). Skipping plot.")
+            else:
+                # Plot the first statistic for the first analysis variable
+                # Find the first valid statistic that was actually computed
+                first_stat = None
+                for stat in stats_list:
+                    if stat in agg_funcs_to_run:
+                        first_stat = stat
+                        break
+
+                if first_stat is None:
+                     print("Warning: Could not find a valid statistic to plot. Skipping plot.")
+                else:
+                    first_var = var_vars[0]
+                    # Construct the expected column name after potential flattening
+                    plot_col_name = f"{first_var}_{first_stat}"
+                    if plot_col_name not in results_df.columns:
+                         # Handle cases where flattening might not have happened (e.g., single stat requested)
+                         if first_stat in results_df.columns and len(var_vars) == 1:
+                             plot_col_name = first_stat
+                         elif first_var in results_df.columns and len(agg_funcs_to_run) == 1:
+                              plot_col_name = first_var
+                         else:
+                              print(f"Warning: Could not reliably determine column name for plotting ('{plot_col_name}' or alternatives). Skipping plot.")
+                              plot_col_name = None # Flag to skip
+
+                    if plot_col_name and plot_col_name in results_df.columns:
+                        plt.figure(figsize=(max(8, len(results_df)*0.5), 6)) # Adjust width slightly based on number of bars
+                        plot_title = f"{first_stat.capitalize()} of {first_var} by {', '.join(class_vars)}"
+                        x_axis_var = class_vars[0]
+                        hue_var = class_vars[1] if len(class_vars) > 1 else None
+
+                        try:
+                            # Convert potential NA group keys (like NaN subgroup) to string for plotting
+                            plot_data = results_df.copy()
+                            for cv in class_vars:
+                                if plot_data[cv].isnull().any():
+                                     plot_data[cv] = plot_data[cv].astype(str).replace('nan', 'Missing') # Replace NaN with 'Missing' string
+
+                            sns.barplot(x=x_axis_var, y=plot_col_name, hue=hue_var, data=plot_data, palette="viridis")
+                            plt.title(plot_title)
+                            plt.ylabel(f"{first_stat.capitalize()} of {first_var}")
+                            plt.xlabel(x_axis_var)
+                            if hue_var:
+                                plt.legend(title=hue_var, bbox_to_anchor=(1.05, 1), loc='upper left')
+                            plt.xticks(rotation=45, ha='right')
+                            plt.tight_layout()
+                            plt.show()
+                        except Exception as e:
+                            print(f"Error during plotting: {e}. Skipping plot.")
+
+                    elif plot_col_name: # Column name was determined but not found
+                         print(f"Warning: Plotting column '{plot_col_name}' not found in results. Skipping plot.")
+
+        else:
+            print(f"Warning: plot_type '{plot_type}' is not currently supported. Skipping plot.")
+    elif plot_type and (results_df is None or results_df.empty):
+         print("Warning: No results generated, skipping plot.")
+
+
+    # --- 7. Return Results ---
+    return results_df
+
+# --- Example Usage ---
+data_means_example = {
+    'Group': ['A', 'A', 'B', 'B', 'A', 'B', 'A', 'B', 'A', 'A', 'C', 'C'],
+    'SubGroup': ['X', 'Y', 'X', 'Y', 'X', 'Y', 'X', 'X', 'Y', 'Y', 'X', np.nan], # Added NaN subgroup
+    'Value1': [10, 12, 15, 18, 11, 16, 13, 14, 12, 10, 20, 22],
+    'Value2': [100, 110, 150, 130, 105, 145, 115, 125, 112, 108, 160, 155],
+    'Weight': [1.0, 0.5, 1.2, 0.8, 1.0, 0.7, 1.1, 0.9, 1.3, 1.0, 1.5, 0.9]
+}
+df_means_example = pd.DataFrame(data_means_example)
+df_means_example['Value1'].iloc[5] = np.nan # Introduce a missing value
+
+print("\n--- Example 1: Basic Stats (Defaults), Grouped ---")
+res1 = py_means(df_means_example, var_vars=['Value1', 'Value2'], class_vars=['Group'])
+
+print("\n--- Example 2: Custom Stats, Weighted, Grouped, No Print ---")
+res2 = py_means(df_means_example,
+                var_vars=['Value1'],
+                class_vars=['Group', 'SubGroup'],
+                stats_list=['n', 'mean', 'std', 'median', 'sum', 'cv', 'invalid_stat'],
+                weight_var='Weight',
+                print_output=False)
+print("Result 2 (DataFrame head):")
+print(res2.head().to_string()) # Use to_string for potentially wide output
+
+print("\n--- Example 3: Overall Stats (No Grouping), Weighted ---")
+# This example now works correctly due to the fix
+res3 = py_means(df_means_example,
+                var_vars=['Value1', 'Value2'],
+                stats_list=['mean', 'std', 'min', 'max', 'n'],
+                weight_var='Weight')
+
+print("\n--- Example 4: Grouped Stats with Bar Plot (Mean Value1 by Group) ---")
+res4 = py_means(df_means_example,
+                var_vars=['Value1'],
+                class_vars=['Group'],
+                stats_list=['mean', 'n'], # Plot will show 'mean'
+                plot_type='bar')
+
+print("\n--- Example 5: Grouped Stats with Bar Plot (N Value2 by Group & SubGroup, including NaN subgroup) ---")
+res5 = py_means(df_means_example,
+                var_vars=['Value2'],
+                class_vars=['Group', 'SubGroup'],
+                stats_list=['n', 'mean'], # Plot will show 'n'
+                plot_type='bar')
+
+print("\n--- Example 6: Error Handling - Non-existent variable ---")
+try:
+    py_means(df_means_example, var_vars=['NonExistent'], class_vars=['Group'])
+except ValueError as e:
+    print(f"Caught expected error: {e}")
+
+print("\n--- Example 7: Single Variable, Overall Stats ---")
+res7 = py_means(df_means_example,
+                var_vars=['Value1'],
                 stats_list=['n', 'mean', 'std'])
