@@ -1,106 +1,34 @@
 from pyspark.sql import SparkSession
-from pyspark.sql.functions import broadcast, col
-import logging # Import Python's standard logging module
-import traceback # Import traceback module for manual formatting if needed (though exc_info is better)
+from pyspark.sql.functions import broadcast
 
-# --- Configuration ---
-# (Keep your S3 paths, Join Config, Output Config as before)
-MAIN_DATA_S3_PATH = "s3a://your-output-data-bucket/unloaded_data/"
-STATIC_DATA_S3_PATH = "s3a://your-static-data-bucket/static-reference-data/"
-FINAL_OUTPUT_S3_PATH = "s3a://your-final-output-bucket/merged-analysis-results/"
-JOIN_KEY_COLUMN = "common_id_column"
-JOIN_TYPE = "left"
-OUTPUT_PARTITION_COLUMNS = ["year", "month"]
-NUM_OUTPUT_PARTITIONS = None
-
-# --- Setup Python Logging ---
-# Configure basic logging to show INFO level messages
-logging.basicConfig(level=logging.INFO,
-                    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
-logger = logging.getLogger("LargeDataMergeApp") # Get a standard Python logger
-
-# --- Spark Session Setup ---
-spark = (
-    SparkSession.builder
-    .appName("LargeDataMerge")
-    # --- Add your Spark configurations here (S3A, memory, etc.) ---
-    .config("spark.hadoop.fs.s3a.impl", "org.apache.hadoop.fs.s3a.S3AFileSystem")
-    .config("spark.hadoop.fs.s3a.aws.credentials.provider", "com.amazonaws.auth.InstanceProfileCredentialsProvider")
-    .config("spark.executor.memory", "8g")
-    .config("spark.driver.memory", "4g")
-    .config("spark.sql.shuffle.partitions", "200")
-    # --- End Spark configurations ---
+# Initialize Spark session
+spark = SparkSession.builder \
+    .appName("S3 Parquet Merge Job") \
+    .config("spark.sql.shuffle.partitions", "200") \  # adjust based on your cluster
+    .config("spark.executor.memory", "8g") \           # adjust based on your infra
+    .config("spark.executor.cores", "4") \             # adjust for optimization
     .getOrCreate()
-)
 
-# Set Spark's internal log level (optional, controls Spark's own verbose logs)
-# spark.sparkContext.setLogLevel("WARN") # Example: reduce Spark's verbosity
+# S3 Paths
+main_dataset_path = "s3://your-bucket-name/path/to/main_dataset/"
+static_dataset_path = "s3://your-bucket-name/path/to/static_dataset/"
+final_output_path = "s3://your-bucket-name/path/to/final_output/"
 
-logger.info("Spark Session Created. Starting data processing...")
+# Read the main dataset (parquet)
+main_df = spark.read.parquet(main_dataset_path)
 
-try:
-    # --- 1. Read the Main Large Dataset ---
-    logger.info(f"Reading main dataset from: {MAIN_DATA_S3_PATH}")
-    main_df = spark.read.parquet(MAIN_DATA_S3_PATH)
-    logger.info(f"Main dataset schema:")
-    main_df.printSchema()
-    # logger.info(f"Main dataset count (triggering action): {main_df.count()}") # Optional
+# Read the static dataset (assuming CSV for example; adjust if Parquet/other)
+static_df = spark.read.option("header", "true").csv(static_dataset_path)
 
-    # --- 2. Read the Smaller Static Dataset ---
-    logger.info(f"Reading static dataset from: {STATIC_DATA_S3_PATH}")
-    static_df = spark.read.parquet(STATIC_DATA_S3_PATH)
-    logger.info(f"Static dataset schema:")
-    static_df.printSchema()
-    static_count = static_df.count()
-    logger.info(f"Static dataset count: {static_count}")
+# Optimize: Broadcast the smaller dataset if it is small enough
+# If static_df is small (<500MB), broadcasting makes joins much faster
+merged_df = main_df.join(broadcast(static_df), on="common_key_column", how="inner")
 
-    # --- 3. Perform the Merge (Join) ---
-    logger.info(f"Performing '{JOIN_TYPE}' join on column(s): {JOIN_KEY_COLUMN}")
+# Optional: Repartition before saving to control file sizes
+final_df = merged_df.repartition(200)  # adjust based on desired output file size
 
-    # Rename static columns to avoid collision
-    static_cols_renamed = [
-        col(c).alias(f"static_{c}") if c != JOIN_KEY_COLUMN else col(c)
-        for c in static_df.columns
-    ]
-    static_df_renamed = static_df.select(static_cols_renamed)
-    logger.info("Renamed static columns (prefix 'static_'). Schema:")
-    static_df_renamed.printSchema()
+# Save the final DataFrame back to S3 as Parquet
+final_df.write.mode("overwrite").parquet(final_output_path)
 
-    # Perform the join using the broadcast hint
-    merged_df = main_df.join(
-        broadcast(static_df_renamed),
-        on=JOIN_KEY_COLUMN,
-        how=JOIN_TYPE
-    )
-
-    logger.info("Join completed. Schema of merged data:")
-    merged_df.printSchema()
-
-    # --- 4. Write the Final Merged Dataset ---
-    logger.info(f"Writing final merged dataset to: {FINAL_OUTPUT_S3_PATH}")
-
-    writer = merged_df.write.format("parquet").mode("overwrite")
-
-    if OUTPUT_PARTITION_COLUMNS:
-        logger.info(f"Partitioning output by: {OUTPUT_PARTITION_COLUMNS}")
-        writer = writer.partitionBy(*OUTPUT_PARTITION_COLUMNS)
-
-    final_df_to_write = merged_df
-    if NUM_OUTPUT_PARTITIONS and NUM_OUTPUT_PARTITIONS > 0:
-         logger.info(f"Repartitioning output to {NUM_OUTPUT_PARTITIONS} partitions.")
-         final_df_to_write = merged_df.repartition(NUM_OUTPUT_PARTITIONS)
-
-    writer.save(FINAL_OUTPUT_S3_PATH)
-    logger.info("Successfully wrote final dataset.")
-
-except Exception as e:
-    # *** Use standard Python logging with exc_info=True ***
-    logger.error(f"An error occurred during processing: {e}", exc_info=True)
-    # Alternatively, manually format traceback:
-    # logger.error(f"An error occurred during processing: {e}\n{traceback.format_exc()}")
-    raise # Re-raise the exception after logging
-
-finally:
-    # --- Stop the Spark Session ---
-    logger.info("Stopping Spark Session.")
-    spark.stop()
+# Stop Spark session
+spark.stop()
