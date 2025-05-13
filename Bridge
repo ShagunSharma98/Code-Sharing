@@ -1,0 +1,60 @@
+import boto3
+import os
+
+# --- Configuration ---
+BUCKET_NAME = 'your-actual-s3-bucket-name'
+S3_DESTINATION_PREFIX = 'data/project_alpha/raw_files/' # The "folder path" in S3. Include trailing slash.
+                                                      # If empty, files go to bucket root.
+
+# List of local files to upload and their desired names in S3
+# Format: (local_file_path, s3_filename_in_prefix)
+FILES_TO_UPLOAD = [
+    ('/path/to/your/local/file1.txt', 'input_file_01.txt'),
+    ('/path/to/your/local/data/archive.zip', 'backup_archive.zip'),
+    ('C:\\Users\\YourUser\\Documents\\report.pdf', 'monthly_report.pdf') # Windows path example
+]
+
+# Optional: Specify AWS region if not set in your AWS config/environment
+AWS_REGION = 'us-east-1' # Or your bucket's region
+
+def upload_specific_files(bucket_name, s3_prefix, files_list, region_name=None):
+    """
+    Uploads a list of specified local files to an S3 bucket under a given prefix.
+    """
+    try:
+        if region_name:
+            s3_client = boto3.client('s3', region_name=region_name)
+        else:
+            s3_client = boto3.client('s3') # Relies on default region from config/env
+    except Exception as e:
+        print(f"Error creating S3 client: {e}")
+        return
+
+    for local_file_path, s3_filename in files_list:
+        if not os.path.exists(local_file_path):
+            print(f"Local file not found: {local_file_path}. Skipping.")
+            continue
+
+        # Construct the full S3 object key
+        # s3_prefix might be "folder1/folder2/" or ""
+        # s3_filename is "file.txt"
+        # We want "folder1/folder2/file.txt" or "file.txt"
+        s3_object_key = s3_prefix + s3_filename
+        # Remove double slashes if s3_prefix was empty and s3_filename started with / (unlikely here)
+        s3_object_key = s3_object_key.replace('//', '/')
+
+
+        print(f"Uploading {local_file_path} to s3://{bucket_name}/{s3_object_key}...")
+        try:
+            s3_client.upload_file(local_file_path, bucket_name, s3_object_key)
+            print(f"Successfully uploaded {local_file_path} to s3://{bucket_name}/{s3_object_key}")
+        except FileNotFoundError:
+            print(f"The file {local_file_path} was not found.")
+        except boto3.exceptions.S3UploadFailedError as e:
+            print(f"S3 upload failed for {local_file_path}: {e}")
+        except Exception as e:
+            print(f"An error occurred uploading {local_file_path}: {e}")
+
+if __name__ == '__main__':
+    upload_specific_files(BUCKET_NAME, S3_DESTINATION_PREFIX, FILES_TO_UPLOAD, region_name=AWS_REGION)
+    print("--- Specific file upload process finished ---")
