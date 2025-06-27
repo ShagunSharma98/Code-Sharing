@@ -1,83 +1,91 @@
 import pandas as pd
-import awswrangler as wr
-from datetime import date
+import boto3
+import uuid
+import time
 
-# --- 1. Configuration ---
-# Replace with your specific AWS details
-S3_STAGING_DIR = "s3://your-athena-query-results-bucket/path/"
-ATHENA_DATABASE = "your_athena_database_name"
-TARGET_TABLE = "your_final_target_table_name"
+# --- Configuration ---
+S3_BUCKET_NAME = "my-athena-data-bucket-12345"
+S3_PREFIX = "my_table_data/"
+S3_OUTPUT_LOCATION = f"s3://{S3_BUCKET_NAME}/athena-query-results/"
+ATHENA_DATABASE = "my_database"
+ATHENA_TABLE = "sales_records"
 
-# --- 2. Define Your SQL Queries ---
-# Each query should return exactly one row
-sql_query_1 = "SELECT 'value_a1' AS col_a, 100 AS col_b, 'value_c1' AS col_c"
-sql_query_2 = "SELECT 'value_a2' AS col_a, 200 AS col_b, 'value_c2' AS col_c"
-sql_query_3 = "SELECT 'value_a3' AS col_a, 300 AS col_b, 'value_c3' AS col_c"
+# boto3 clients
+glue_client = boto3.client('glue')
+athena_client = boto3.client('athena')
+s3_client = boto3.client('s3')
 
-queries = [sql_query_1, sql_query_2, sql_query_3]
+# --- Helper function to check if table exists ---
+def table_exists(database, table):
+    try:
+        glue_client.get_table(DatabaseName=database, Name=table)
+        return True
+    except glue_client.exceptions.EntityNotFoundException:
+        return False
 
-print("Starting process...")
-
-try:
-    # --- 3. Run Queries and Collect DataFrames ---
-    # We will run each query and store its resulting DataFrame in a list
-    list_of_dfs = []
-    for i, query in enumerate(queries, 1):
-        print(f"Running query {i}...")
-        df = wr.athena.read_sql_query(
-            sql=query,
-            database=ATHENA_DATABASE,
-            s3_output=S3_STAGING_DIR
-        )
-        list_of_dfs.append(df)
-        print(f"Query {i} finished, received 1 row.")
-
-    # --- 4. Concatenate the Results ---
-    # Combine the three 1-row DataFrames into a single 3-row DataFrame
-    # ignore_index=True resets the index to be a clean 0, 1, 2
-    final_df = pd.concat(list_of_dfs, ignore_index=True)
-
-    print("\nOriginal concatenated data:")
-    print(final_df)
-
-    # --- 5. Add New Columns ---
-    # Add today's date column.
-    # It's good practice to name it like a partition key, e.g., 'run_date' or 'dt'
-    final_df['run_date'] = date.today().strftime('%Y-%m-%d')
-
-    # Add the flag column with your specified values
-    # This works because the list has 3 items and the DataFrame has 3 rows.
-    final_df['flag'] = ['I', 'B', 'C']
-
-    print("\nData after adding new columns:")
-    print(final_df)
-
-    # --- 6. Append Data to the Target Athena Table ---
-    # This function writes the DataFrame to S3 (in Parquet format by default)
-    # and ensures the Athena table metadata is updated.
-    
-    # IMPORTANT: Ensure the column names and data types in `final_df` match your
-    # existing Athena table `TARGET_TABLE`.
-    
-    # If your table is partitioned (e.g., by the date), specify it here.
-    # This is highly recommended for performance.
-    partition_cols = ['run_date']
-
-    print(f"\nAppending {len(final_df)} rows to Athena table: {ATHENA_DATABASE}.{TARGET_TABLE}")
-
-    response = wr.s3.to_parquet(
-        df=final_df,
-        path=f"s3://your-table-data-bucket/path/to/{TARGET_TABLE}/", # The S3 path where the table's data is stored
-        dataset=True,
-        database=ATHENA_DATABASE,
-        table=TARGET_TABLE,
-        mode="append",  # This is the key to adding new data without deleting old data
-        partition_cols=partition_cols # Remove if your table is not partitioned
+# --- Helper function to run and wait for Athena query ---
+def run_athena_query(query):
+    response = athena_client.start_query_execution(
+        QueryString=query,
+        QueryExecutionContext={'Database': ATHENA_DATABASE},
+        ResultConfiguration={'OutputLocation': S3_OUTPUT_LOCATION}
     )
+    query_execution_id = response['QueryExecutionId']
     
-    print("\nProcess finished successfully!")
-    print("Data appended. Response from awswrangler:")
-    print(response)
+    while True:
+        status = athena_client.get_query_execution(QueryExecutionId=query_execution_id)
+        state = status['QueryExecution']['Status']['State']
+        if state in ['SUCCEEDED', 'FAILED', 'CANCELLED']:
+            if state == 'FAILED':
+                print("Query FAILED:", status['QueryExecution']['Status']['StateChangeReason'])
+            return
+        time.sleep(2)
 
-except Exception as e:
-    print(f"An error occurred: {e}")
+# --- Main Logic ---
+
+# 1. Create DataFrame
+df_new_records = pd.DataFrame({
+    'order_id': [201], 'product_name': ['Monitor'], 'quantity': [1], 'sale_price': [350.0]
+})
+
+# 2. Check if table exists, create if not
+if not table_exists(ATHENA_DATABASE, ATHENA_TABLE):
+    print(f"Table `{ATHENA_DATABASE}`.`{ATHENA_TABLE}` does not exist. Creating it...")
+    
+    # NOTE: Manually defining the schema is brittle. awswrangler infers this.
+    create_table_ddl = f"""
+    CREATE EXTERNAL TABLE `{ATHENA_DATABASE}`.`{ATHENA_TABLE}`(
+      `order_id` int, 
+      `product_name` string, 
+      `quantity` int, 
+      `sale_price` double)
+    STORED AS PARQUET
+    LOCATION 's3://{S3_BUCKET_NAME}/{S3_PREFIX}'
+    tblproperties ('parquet.compress'='SNAPPY');
+    """
+    run_athena_query(create_table_ddl)
+    print("Table created.")
+else:
+    print(f"Table `{ATHENA_DATABASE}`.`{ATHENA_TABLE}` already exists. Appending data.")
+
+# 3. Convert DataFrame to Parquet and upload to S3
+# Generate a unique filename to avoid collisions
+file_name = f"{uuid.uuid4()}.parquet"
+s3_key = f"{S3_PREFIX}{file_name}"
+
+# Convert to parquet in-memory
+parquet_buffer = df_new_records.to_parquet(index=False, engine='pyarrow')
+
+s3_client.put_object(
+    Bucket=S3_BUCKET_NAME,
+    Key=s3_key,
+    Body=parquet_buffer
+)
+print(f"Uploaded data to s3://{S3_BUCKET_NAME}/{s3_key}")
+
+# 4. If your table is partitioned, you need to refresh them.
+# For non-partitioned tables, this isn't strictly necessary but good practice.
+# For partitioned tables, it is MANDATORY.
+# print("Running MSCK REPAIR TABLE to discover new data/partitions...")
+# run_athena_query(f"MSCK REPAIR TABLE `{ATHENA_TABLE}`")
+# print("Table repaired.")
