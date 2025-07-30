@@ -1,64 +1,35 @@
-import boto3
-import pandas as pd
-import time
+from langchain.agents import AgentExecutor, create_react_agent, Tool
+from langchain_openai import ChatOpenAI
+from langchain import hub
 
-# --- Tool 1: Schema Inspector ---
-def get_table_schema(table_name: str, database: str = 'your_glue_database') -> str:
-    """
-    Retrieves the DDL schema for a specific table in the AWS Glue Data Catalog.
-    Use this to understand the columns and data types of a table.
-    """
-    try:
-        glue_client = boto3.client('glue')
-        response = glue_client.get_table(DatabaseName=database, Name=table_name)
-        # Format the schema nicely for the LLM
-        columns = response['Table']['StorageDescriptor']['Columns']
-        schema_info = f"Schema for table '{table_name}':\n"
-        for col in columns:
-            schema_info += f"- {col['Name']}: {col['Type']}\n"
-        return schema_info
-    except Exception as e:
-        return f"Error: Could not get schema for table {table_name}. {str(e)}"
+# 1. Define the tools for the agent
+tools = [
+    Tool(
+        name="SchemaInspector",
+        func=get_table_schema,
+        description="Useful for getting the schema and column details of a specific database table. Input should be the table name.",
+    ),
+    Tool(
+        name="AthenaQueryExecutor",
+        func=run_athena_query,
+        description="Useful for executing an Athena SQL query to get data from the database. Input should be a complete and valid SQL query.",
+    ),
+]
 
-# --- Tool 2: Athena Query Executor ---
-def run_athena_query(query: str, database: str = 'your_glue_database', s3_output_location: str = 's3://your-athena-query-results-bucket/') -> pd.DataFrame:
-    """
-    Runs a SQL query using AWS Athena and returns the result as a pandas DataFrame.
-    Use this to query the data.
-    """
-    athena_client = boto3.client('athena')
-    try:
-        response = athena_client.start_query_execution(
-            QueryString=query,
-            QueryExecutionContext={'Database': database},
-            ResultConfiguration={'OutputLocation': s3_output_location}
-        )
-        query_execution_id = response['QueryExecutionId']
+# 2. Get the ReAct agent prompt template
+# This prompt is engineered to make the LLM think in a "Thought, Action, Observation" loop
+prompt = hub.pull("hwchase17/react")
 
-        # Wait for the query to complete
-        state = 'RUNNING'
-        while state in ['RUNNING', 'QUEUED']:
-            time.sleep(2)
-            result = athena_client.get_query_execution(QueryExecutionId=query_execution_id)
-            state = result['QueryExecution']['Status']['State']
-            if state == 'FAILED':
-                return f"Query failed: {result['QueryExecution']['Status']['StateChangeReason']}"
-            elif state == 'CANCELLED':
-                return "Query was cancelled."
+# 3. Initialize the LLM
+llm = ChatOpenAI(temperature=0, model_name='gpt-4')
 
-        # Fetch results
-        result_paginator = athena_client.get_paginator('get_query_results')
-        result_iter = result_paginator.paginate(QueryExecutionId=query_execution_id)
-        
-        rows = []
-        column_info = None
-        for result_page in result_iter:
-            if not column_info:
-                column_info = [col['Name'] for col in result_page['ResultSet']['ResultSetMetadata']['ColumnInfo']]
-            for row in result_page['ResultSet']['Rows'][1:]: # Skip header row
-                rows.append([item.get('VarCharValue') for item in row['Data']])
-        
-        return pd.DataFrame(rows, columns=column_info)
+# 4. Create the agent
+agent = create_react_agent(llm, tools, prompt)
 
-    except Exception as e:
-        return f"Error running query: {str(e)}"
+# 5. Create the Agent Executor (the runtime for the agent)
+agent_executor = AgentExecutor(agent=agent, tools=tools, verbose=True, handle_parsing_errors=True)
+
+# --- This is how you address Requirement #3: Getting References ---
+# By setting `verbose=True`, the agent's thought process is printed.
+# For a production app, you would capture this using "Callbacks".
+# It will show the exact tools called, the inputs (like the SQL query), and the outputs.
