@@ -1,91 +1,64 @@
-import pandas as pd
 import boto3
-import uuid
+import pandas as pd
 import time
 
-# --- Configuration ---
-S3_BUCKET_NAME = "my-athena-data-bucket-12345"
-S3_PREFIX = "my_table_data/"
-S3_OUTPUT_LOCATION = f"s3://{S3_BUCKET_NAME}/athena-query-results/"
-ATHENA_DATABASE = "my_database"
-ATHENA_TABLE = "sales_records"
-
-# boto3 clients
-glue_client = boto3.client('glue')
-athena_client = boto3.client('athena')
-s3_client = boto3.client('s3')
-
-# --- Helper function to check if table exists ---
-def table_exists(database, table):
-    try:
-        glue_client.get_table(DatabaseName=database, Name=table)
-        return True
-    except glue_client.exceptions.EntityNotFoundException:
-        return False
-
-# --- Helper function to run and wait for Athena query ---
-def run_athena_query(query):
-    response = athena_client.start_query_execution(
-        QueryString=query,
-        QueryExecutionContext={'Database': ATHENA_DATABASE},
-        ResultConfiguration={'OutputLocation': S3_OUTPUT_LOCATION}
-    )
-    query_execution_id = response['QueryExecutionId']
-    
-    while True:
-        status = athena_client.get_query_execution(QueryExecutionId=query_execution_id)
-        state = status['QueryExecution']['Status']['State']
-        if state in ['SUCCEEDED', 'FAILED', 'CANCELLED']:
-            if state == 'FAILED':
-                print("Query FAILED:", status['QueryExecution']['Status']['StateChangeReason'])
-            return
-        time.sleep(2)
-
-# --- Main Logic ---
-
-# 1. Create DataFrame
-df_new_records = pd.DataFrame({
-    'order_id': [201], 'product_name': ['Monitor'], 'quantity': [1], 'sale_price': [350.0]
-})
-
-# 2. Check if table exists, create if not
-if not table_exists(ATHENA_DATABASE, ATHENA_TABLE):
-    print(f"Table `{ATHENA_DATABASE}`.`{ATHENA_TABLE}` does not exist. Creating it...")
-    
-    # NOTE: Manually defining the schema is brittle. awswrangler infers this.
-    create_table_ddl = f"""
-    CREATE EXTERNAL TABLE `{ATHENA_DATABASE}`.`{ATHENA_TABLE}`(
-      `order_id` int, 
-      `product_name` string, 
-      `quantity` int, 
-      `sale_price` double)
-    STORED AS PARQUET
-    LOCATION 's3://{S3_BUCKET_NAME}/{S3_PREFIX}'
-    tblproperties ('parquet.compress'='SNAPPY');
+# --- Tool 1: Schema Inspector ---
+def get_table_schema(table_name: str, database: str = 'your_glue_database') -> str:
     """
-    run_athena_query(create_table_ddl)
-    print("Table created.")
-else:
-    print(f"Table `{ATHENA_DATABASE}`.`{ATHENA_TABLE}` already exists. Appending data.")
+    Retrieves the DDL schema for a specific table in the AWS Glue Data Catalog.
+    Use this to understand the columns and data types of a table.
+    """
+    try:
+        glue_client = boto3.client('glue')
+        response = glue_client.get_table(DatabaseName=database, Name=table_name)
+        # Format the schema nicely for the LLM
+        columns = response['Table']['StorageDescriptor']['Columns']
+        schema_info = f"Schema for table '{table_name}':\n"
+        for col in columns:
+            schema_info += f"- {col['Name']}: {col['Type']}\n"
+        return schema_info
+    except Exception as e:
+        return f"Error: Could not get schema for table {table_name}. {str(e)}"
 
-# 3. Convert DataFrame to Parquet and upload to S3
-# Generate a unique filename to avoid collisions
-file_name = f"{uuid.uuid4()}.parquet"
-s3_key = f"{S3_PREFIX}{file_name}"
+# --- Tool 2: Athena Query Executor ---
+def run_athena_query(query: str, database: str = 'your_glue_database', s3_output_location: str = 's3://your-athena-query-results-bucket/') -> pd.DataFrame:
+    """
+    Runs a SQL query using AWS Athena and returns the result as a pandas DataFrame.
+    Use this to query the data.
+    """
+    athena_client = boto3.client('athena')
+    try:
+        response = athena_client.start_query_execution(
+            QueryString=query,
+            QueryExecutionContext={'Database': database},
+            ResultConfiguration={'OutputLocation': s3_output_location}
+        )
+        query_execution_id = response['QueryExecutionId']
 
-# Convert to parquet in-memory
-parquet_buffer = df_new_records.to_parquet(index=False, engine='pyarrow')
+        # Wait for the query to complete
+        state = 'RUNNING'
+        while state in ['RUNNING', 'QUEUED']:
+            time.sleep(2)
+            result = athena_client.get_query_execution(QueryExecutionId=query_execution_id)
+            state = result['QueryExecution']['Status']['State']
+            if state == 'FAILED':
+                return f"Query failed: {result['QueryExecution']['Status']['StateChangeReason']}"
+            elif state == 'CANCELLED':
+                return "Query was cancelled."
 
-s3_client.put_object(
-    Bucket=S3_BUCKET_NAME,
-    Key=s3_key,
-    Body=parquet_buffer
-)
-print(f"Uploaded data to s3://{S3_BUCKET_NAME}/{s3_key}")
+        # Fetch results
+        result_paginator = athena_client.get_paginator('get_query_results')
+        result_iter = result_paginator.paginate(QueryExecutionId=query_execution_id)
+        
+        rows = []
+        column_info = None
+        for result_page in result_iter:
+            if not column_info:
+                column_info = [col['Name'] for col in result_page['ResultSet']['ResultSetMetadata']['ColumnInfo']]
+            for row in result_page['ResultSet']['Rows'][1:]: # Skip header row
+                rows.append([item.get('VarCharValue') for item in row['Data']])
+        
+        return pd.DataFrame(rows, columns=column_info)
 
-# 4. If your table is partitioned, you need to refresh them.
-# For non-partitioned tables, this isn't strictly necessary but good practice.
-# For partitioned tables, it is MANDATORY.
-# print("Running MSCK REPAIR TABLE to discover new data/partitions...")
-# run_athena_query(f"MSCK REPAIR TABLE `{ATHENA_TABLE}`")
-# print("Table repaired.")
+    except Exception as e:
+        return f"Error running query: {str(e)}"
