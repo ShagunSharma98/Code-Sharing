@@ -1,360 +1,356 @@
-# core/intent_classifier.py
-import re
-import spacy
+# core/metadata_manager.py
+import boto3
+import duckdb
 import pandas as pd
-from sklearn.ensemble import RandomForestClassifier
-from sklearn.feature_extraction.text import TfidfVectorizer
-from sklearn.pipeline import Pipeline
-from sklearn.model_selection import train_test_split
-import joblib
-from typing import List, Dict, Tuple
+import networkx as nx
+from typing import Dict, List, Set, Tuple
+import json
 from dataclasses import dataclass
+from collections import defaultdict
+import numpy as np
 
 @dataclass
-class IntentResult:
-    intent_type: str
-    confidence: float
-    entities: List[str]
-    filters: List[Dict]
-    aggregations: List[str]
-    dimensions: List[str]
+class TableMetadata:
+    database_name: str
+    table_name: str
+    columns: List[Dict]
+    row_count: int
+    size_bytes: int
+    partitions: List[str]
+    last_updated: str
+    
+@dataclass
+class ColumnMetadata:
+    name: str
+    data_type: str
+    is_nullable: bool
+    distinct_count: int
+    null_percentage: float
+    sample_values: List
+    is_key_candidate: bool
 
-class IntentClassifier:
-    def __init__(self):
-        self.nlp = spacy.load("en_core_web_sm")
-        self.intent_model = None
-        self.vectorizer = None
-        self.entity_patterns = self._build_entity_patterns()
-        self.intent_patterns = self._build_intent_patterns()
-        self.trained = False
+class MetadataManager:
+    def __init__(self, athena_config: Dict):
+        self.athena_client = boto3.client('athena', 
+                                        region_name=athena_config['region'])
+        self.s3_client = boto3.client('s3')
+        self.metadata_db = duckdb.connect('metadata.db')
+        self.relationship_graph = nx.Graph()
+        self.athena_config = athena_config
+        self._setup_metadata_tables()
         
-    def _build_intent_patterns(self) -> Dict[str, Dict]:
-        """Define patterns for different analysis intents"""
-        return {
-            'aggregation': {
-                'keywords': [
-                    'total', 'sum', 'count', 'average', 'mean', 'max', 'maximum',
-                    'min', 'minimum', 'aggregate', 'group by', 'breakdown'
-                ],
-                'patterns': [
-                    r'total \w+ by \w+',
-                    r'sum of \w+',
-                    r'count of \w+',
-                    r'average \w+ per \w+',
-                    r'breakdown of \w+',
-                    r'\w+ by \w+ and \w+'
-                ]
-            },
-            'comparison': {
-                'keywords': [
-                    'compare', 'vs', 'versus', 'difference', 'between',
-                    'against', 'relative to', 'compared to'
-                ],
-                'patterns': [
-                    r'compare \w+ and \w+',
-                    r'\w+ vs \w+',
-                    r'difference between \w+ and \w+',
-                    r'\w+ versus \w+'
-                ]
-            },
-            'filtering': {
-                'keywords': [
-                    'where', 'filter', 'only', 'exclude', 'remove',
-                    'specific', 'particular', 'certain'
-                ],
-                'patterns': [
-                    r'where \w+ (equals|is|=) \w+',
-                    r'only \w+ that \w+',
-                    r'filter by \w+',
-                    r'exclude \w+ where \w+'
-                ]
-            },
-            'time_series': {
-                'keywords': [
-                    'trend', 'over time', 'time series', 'monthly', 'daily',
-                    'yearly', 'quarterly', 'weekly', 'growth', 'change',
-                    'evolution', 'historical'
-                ],
-                'patterns': [
-                    r'\w+ over time',
-                    r'monthly \w+',
-                    r'trend in \w+',
-                    r'\w+ growth',
-                    r'historical \w+'
-                ]
-            },
-            'ranking': {
-                'keywords': [
-                    'top', 'bottom', 'best', 'worst', 'highest', 'lowest',
-                    'rank', 'order', 'sort', 'most', 'least'
-                ],
-                'patterns': [
-                    r'top \d+ \w+',
-                    r'best \w+',
-                    r'highest \w+',
-                    r'rank \w+ by \w+'
-                ]
-            },
-            'correlation': {
-                'keywords': [
-                    'correlation', 'relationship', 'related', 'associated',
-                    'connection', 'impact', 'influence', 'affect'
-                ],
-                'patterns': [
-                    r'correlation between \w+ and \w+',
-                    r'relationship between \w+ and \w+',
-                    r'how \w+ affects \w+'
-                ]
-            }
-        }
+    def _setup_metadata_tables(self):
+        """Initialize metadata storage tables"""
+        self.metadata_db.execute("""
+            CREATE TABLE IF NOT EXISTS table_metadata (
+                database_name VARCHAR,
+                table_name VARCHAR,
+                column_name VARCHAR,
+                data_type VARCHAR,
+                is_nullable BOOLEAN,
+                distinct_count BIGINT,
+                null_percentage FLOAT,
+                sample_values JSON,
+                is_key_candidate BOOLEAN,
+                last_profiled TIMESTAMP,
+                PRIMARY KEY (database_name, table_name, column_name)
+            )
+        """)
+        
+        self.metadata_db.execute("""
+            CREATE TABLE IF NOT EXISTS table_relationships (
+                source_table VARCHAR,
+                target_table VARCHAR,
+                relationship_type VARCHAR,
+                confidence_score FLOAT,
+                join_columns JSON,
+                PRIMARY KEY (source_table, target_table)
+            )
+        """)
     
-    def _build_entity_patterns(self) -> Dict[str, List[str]]:
-        """Build patterns for entity extraction"""
-        # **[INPUT NEEDED: Your domain-specific entities]**
-        # Please provide lists of common entities in your domain
-        return {
-            'metrics': [
-                # Examples - replace with your actual metrics
-                'revenue', 'sales', 'profit', 'cost', 'price', 'quantity',
-                'users', 'customers', 'orders', 'transactions', 'clicks'
-            ],
-            'dimensions': [
-                # Examples - replace with your actual dimensions  
-                'region', 'country', 'state', 'city', 'product', 'category',
-                'channel', 'segment', 'department', 'brand', 'campaign'
-            ],
-            'time_periods': [
-                'day', 'week', 'month', 'quarter', 'year', 'daily', 'weekly',
-                'monthly', 'quarterly', 'yearly', 'today', 'yesterday'
-            ],
-            'operators': [
-                'greater than', 'less than', 'equals', 'not equals', 'contains',
-                'starts with', 'ends with', 'between', 'in', 'not in'
-            ]
-        }
+    def discover_all_schemas(self) -> Dict[str, List[TableMetadata]]:
+        """Main entry point for schema discovery"""
+        print("Starting schema discovery...")
+        
+        # Step 1: Get all databases and tables
+        databases = self._get_all_databases()
+        all_metadata = {}
+        
+        for db_name in databases:
+            print(f"Processing database: {db_name}")
+            tables = self._get_tables_in_database(db_name)
+            table_metadata_list = []
+            
+            for table_name in tables:
+                print(f"  Processing table: {table_name}")
+                metadata = self._profile_table(db_name, table_name)
+                table_metadata_list.append(metadata)
+                
+            all_metadata[db_name] = table_metadata_list
+        
+        # Step 2: Detect relationships between tables
+        self._detect_relationships(all_metadata)
+        
+        # Step 3: Save to persistent storage
+        self._save_metadata(all_metadata)
+        
+        return all_metadata
     
-    def classify_intent(self, query: str) -> IntentResult:
-        """Main method to classify user intent"""
-        query_lower = query.lower()
-        
-        # Method 1: Pattern-based classification (fast, deterministic)
-        pattern_result = self._classify_by_patterns(query_lower)
-        
-        # Method 2: ML-based classification (if trained model available)
-        ml_result = self._classify_by_ml(query) if self.trained else None
-        
-        # Combine results
-        if pattern_result.confidence > 0.7:
-            final_result = pattern_result
-        elif ml_result and ml_result.confidence > pattern_result.confidence:
-            final_result = ml_result  
-        else:
-            final_result = pattern_result
-        
-        # Extract entities
-        entities = self._extract_entities(query)
-        final_result.entities = entities
-        
-        # Extract filters, aggregations, dimensions
-        filters = self._extract_filters(query)
-        aggregations = self._extract_aggregations(query, final_result.intent_type)
-        dimensions = self._extract_dimensions(query, entities)
-        
-        final_result.filters = filters
-        final_result.aggregations = aggregations
-        final_result.dimensions = dimensions
-        
-        return final_result
+    def _get_all_databases(self) -> List[str]:
+        """Get all database names from Athena"""
+        query = "SHOW DATABASES"
+        result = self._execute_athena_query(query)
+        return [row[0] for row in result]
     
-    def _classify_by_patterns(self, query: str) -> IntentResult:
-        """Pattern-based intent classification"""
-        intent_scores = {}
+    def _get_tables_in_database(self, db_name: str) -> List[str]:
+        """Get all tables in a specific database"""
+        query = f"SHOW TABLES IN {db_name}"
+        result = self._execute_athena_query(query)
+        return [row[0] for row in result]
+    
+    def _profile_table(self, db_name: str, table_name: str) -> TableMetadata:
+        """Profile a single table to extract metadata"""
+        # Get basic table info
+        table_info_query = f"""
+        SELECT 
+            column_name, 
+            data_type, 
+            is_nullable
+        FROM information_schema.columns 
+        WHERE table_schema = '{db_name}' 
+        AND table_name = '{table_name}'
+        ORDER BY ordinal_position
+        """
         
-        for intent, config in self.intent_patterns.items():
-            score = 0.0
-            
-            # Keyword matching
-            keyword_matches = sum(1 for kw in config['keywords'] 
-                                if kw in query)
-            score += (keyword_matches / len(config['keywords'])) * 0.6
-            
-            # Pattern matching
-            pattern_matches = sum(1 for pattern in config['patterns']
-                                if re.search(pattern, query, re.IGNORECASE))
-            if pattern_matches > 0:
-                score += 0.4
-            
-            intent_scores[intent] = score
+        column_info = self._execute_athena_query(table_info_query)
         
-        # Get best match
-        best_intent = max(intent_scores, key=intent_scores.get)
-        confidence = intent_scores[best_intent]
+        # Get table statistics
+        stats_query = f"SELECT COUNT(*) as row_count FROM {db_name}.{table_name}"
+        stats_result = self._execute_athena_query(stats_query)
+        row_count = stats_result[0][0] if stats_result else 0
         
-        return IntentResult(
-            intent_type=best_intent,
-            confidence=confidence,
-            entities=[],
-            filters=[],
-            aggregations=[],
-            dimensions=[]
+        # Profile each column
+        columns = []
+        for col_name, data_type, is_nullable in column_info:
+            col_metadata = self._profile_column(db_name, table_name, 
+                                              col_name, data_type, row_count)
+            columns.append(col_metadata.__dict__)
+        
+        return TableMetadata(
+            database_name=db_name,
+            table_name=table_name,
+            columns=columns,
+            row_count=row_count,
+            size_bytes=0,  # Calculate if needed
+            partitions=[],  # Extract if using partitioned tables
+            last_updated=""  # Get from table properties
         )
     
-    def _classify_by_ml(self, query: str) -> IntentResult:
-        """ML-based intent classification"""
-        if not self.intent_model:
-            return None
-            
-        features = self.vectorizer.transform([query])
-        prediction = self.intent_model.predict(features)[0]
-        probabilities = self.intent_model.predict_proba(features)[0]
-        confidence = max(probabilities)
+    def _profile_column(self, db_name: str, table_name: str, 
+                       col_name: str, data_type: str, total_rows: int) -> ColumnMetadata:
+        """Profile individual column statistics"""
         
-        return IntentResult(
-            intent_type=prediction,
-            confidence=confidence,
-            entities=[],
-            filters=[],
-            aggregations=[],
-            dimensions=[]
-        )
-    
-    def _extract_entities(self, query: str) -> List[str]:
-        """Extract business entities from query"""
-        doc = self.nlp(query)
-        entities = []
+        # Get distinct count and null percentage
+        profile_query = f"""
+        SELECT 
+            COUNT(DISTINCT {col_name}) as distinct_count,
+            COUNT(*) as non_null_count,
+            COUNT(CASE WHEN {col_name} IS NULL THEN 1 END) as null_count
+        FROM {db_name}.{table_name}
+        """
         
-        # Named entity recognition
-        for ent in doc.ents:
-            entities.append(ent.text)
-        
-        # Domain-specific entity matching
-        query_lower = query.lower()
-        for entity_type, entity_list in self.entity_patterns.items():
-            for entity in entity_list:
-                if entity.lower() in query_lower:
-                    entities.append(entity)
-        
-        return list(set(entities))  # Remove duplicates
-    
-    def _extract_filters(self, query: str) -> List[Dict]:
-        """Extract filter conditions from query"""
-        filters = []
-        
-        # Common filter patterns
-        filter_patterns = [
-            (r'where (\w+) equals (\w+)', 'equals'),
-            (r'where (\w+) is (\w+)', 'equals'),
-            (r'where (\w+) = (\w+)', 'equals'),
-            (r'(\w+) greater than (\w+)', 'greater_than'),
-            (r'(\w+) > (\w+)', 'greater_than'),
-            (r'(\w+) less than (\w+)', 'less_than'),
-            (r'(\w+) < (\w+)', 'less_than'),
-            (r'only (\w+) where (\w+)', 'filter'),
-        ]
-        
-        for pattern, operator in filter_patterns:
-            matches = re.findall(pattern, query, re.IGNORECASE)
-            for match in matches:
-                filters.append({
-                    'column': match[0],
-                    'operator': operator,
-                    'value': match[1] if len(match) > 1 else None
-                })
-        
-        return filters
-    
-    def _extract_aggregations(self, query: str, intent_type: str) -> List[str]:
-        """Extract aggregation functions needed"""
-        aggregations = []
-        query_lower = query.lower()
-        
-        agg_keywords = {
-            'sum': ['total', 'sum'],
-            'count': ['count', 'number of'],
-            'avg': ['average', 'mean'],
-            'max': ['maximum', 'max', 'highest'],
-            'min': ['minimum', 'min', 'lowest']
-        }
-        
-        for agg_func, keywords in agg_keywords.items():
-            if any(kw in query_lower for kw in keywords):
-                aggregations.append(agg_func)
-        
-        # Default aggregations based on intent
-        if intent_type == 'aggregation' and not aggregations:
-            aggregations = ['sum']  # Default
-        elif intent_type == 'comparison':
-            aggregations = ['sum', 'count']
-        
-        return aggregations
-    
-    def _extract_dimensions(self, query: str, entities: List[str]) -> List[str]:
-        """Extract grouping dimensions"""
-        dimensions = []
-        query_lower = query.lower()
-        
-        # Look for "by" keywords
-        by_patterns = [
-            r'by (\w+)',
-            r'per (\w+)',  
-            r'for each (\w+)',
-            r'group by (\w+)'
-        ]
-        
-        for pattern in by_patterns:
-            matches = re.findall(pattern, query_lower)
-            dimensions.extend(matches)
-        
-        # Use dimension entities
-        for entity in entities:
-            if entity.lower() in self.entity_patterns['dimensions']:
-                dimensions.append(entity)
-        
-        return list(set(dimensions))
-    
-    def train_model(self, training_data: List[Tuple[str, str]]):
-        """Train the ML model on your specific queries"""
-        # **[INPUT NEEDED: Training data]**
-        # Please provide examples of your typical queries with labels
-        
-        if not training_data:
-            print("No training data provided, using pattern-based classification only")
-            return
-        
-        queries, labels = zip(*training_data)
-        
-        # Create pipeline
-        self.vectorizer = TfidfVectorizer(
-            ngram_range=(1, 3),
-            max_features=5000,
-            stop_words='english'
-        )
-        
-        self.intent_model = Pipeline([
-            ('tfidf', self.vectorizer),
-            ('classifier', RandomForestClassifier(n_estimators=100, random_state=42))
-        ])
-        
-        # Train
-        X_train, X_test, y_train, y_test = train_test_split(
-            queries, labels, test_size=0.2, random_state=42
-        )
-        
-        self.intent_model.fit(X_train, y_train)
-        
-        # Evaluate
-        accuracy = self.intent_model.score(X_test, y_test)
-        print(f"Model trained with accuracy: {accuracy:.3f}")
-        
-        # Save model
-        joblib.dump(self.intent_model, 'models/intent_model/intent_classifier.pkl')
-        self.trained = True
-    
-    def load_model(self):
-        """Load pre-trained model"""
         try:
-            self.intent_model = joblib.load('models/intent_model/intent_classifier.pkl')
-            self.trained = True
-            print("Intent model loaded successfully")
+            result = self._execute_athena_query(profile_query)
+            distinct_count, non_null_count, null_count = result[0]
+            null_percentage = (null_count / total_rows) * 100 if total_rows > 0 else 0
         except:
-            print("No pre-trained model found, using pattern-based classification")
+            distinct_count, null_percentage = 0, 0
+        
+        # Get sample values
+        sample_query = f"""
+        SELECT DISTINCT {col_name} 
+        FROM {db_name}.{table_name} 
+        WHERE {col_name} IS NOT NULL 
+        LIMIT 10
+        """
+        
+        try:
+            sample_result = self._execute_athena_query(sample_query)
+            sample_values = [row[0] for row in sample_result]
+        except:
+            sample_values = []
+        
+        # Determine if column is a key candidate
+        is_key_candidate = (distinct_count / total_rows) > 0.95 if total_rows > 0 else False
+        
+        return ColumnMetadata(
+            name=col_name,
+            data_type=data_type,
+            is_nullable=is_nullable.upper() == 'YES',
+            distinct_count=distinct_count,
+            null_percentage=null_percentage,
+            sample_values=sample_values,
+            is_key_candidate=is_key_candidate
+        )
+    
+    def _detect_relationships(self, all_metadata: Dict[str, List[TableMetadata]]):
+        """Detect relationships between tables using various heuristics"""
+        all_tables = []
+        for db_tables in all_metadata.values():
+            all_tables.extend(db_tables)
+        
+        relationships = []
+        
+        # Method 1: Column name matching (foreign key inference)
+        for i, table1 in enumerate(all_tables):
+            for j, table2 in enumerate(all_tables):
+                if i >= j:  # Avoid duplicate pairs
+                    continue
+                
+                # Check for potential foreign key relationships
+                fk_relationships = self._find_foreign_key_candidates(table1, table2)
+                relationships.extend(fk_relationships)
+        
+        # Method 2: Value overlap analysis (for tables with similar data)
+        # This is computationally expensive, so we'll do it selectively
+        
+        # Store relationships
+        for rel in relationships:
+            self.relationship_graph.add_edge(
+                f"{rel['source_db']}.{rel['source_table']}", 
+                f"{rel['target_db']}.{rel['target_table']}",
+                relationship_type=rel['type'],
+                confidence=rel['confidence'],
+                join_columns=rel['join_columns']
+            )
+    
+    def _find_foreign_key_candidates(self, table1: TableMetadata, 
+                                   table2: TableMetadata) -> List[Dict]:
+        """Find potential foreign key relationships between two tables"""
+        relationships = []
+        
+        # Common patterns for FK relationships
+        fk_patterns = [
+            # table2 has column that matches table1's primary key pattern
+            (r'(.+)_id$', r'\1_id$'),  # user_id matches user_id
+            (r'id$', r'(.+)_id$'),     # id matches something_id  
+            (r'(.+)_key$', r'\1_key$'), # user_key matches user_key
+        ]
+        
+        table1_cols = {col['name']: col for col in table1.columns}
+        table2_cols = {col['name']: col for col in table2.columns}
+        
+        for col1_name, col1_info in table1_cols.items():
+            for col2_name, col2_info in table2_cols.items():
+                
+                # Check if column names suggest a relationship
+                confidence = 0.0
+                
+                # Exact name match
+                if col1_name == col2_name:
+                    confidence = 0.9
+                
+                # Pattern matching
+                elif col1_name.endswith('_id') and col2_name.endswith('_id'):
+                    if col1_name.replace('_id', '') in table2.table_name.lower():
+                        confidence = 0.8
+                
+                # Data type compatibility
+                if confidence > 0 and col1_info['data_type'] == col2_info['data_type']:
+                    confidence += 0.1
+                
+                if confidence > 0.7:  # Threshold for FK candidate
+                    relationships.append({
+                        'source_db': table1.database_name,
+                        'source_table': table1.table_name,
+                        'target_db': table2.database_name,
+                        'target_table': table2.table_name,
+                        'type': 'foreign_key',
+                        'confidence': confidence,
+                        'join_columns': [(col1_name, col2_name)]
+                    })
+        
+        return relationships
+    
+    def _execute_athena_query(self, query: str) -> List[Tuple]:
+        """Execute query in Athena and return results"""
+        # **[INPUT NEEDED: Your Athena execution configuration]**
+        # Please provide:
+        # - S3 bucket for query results
+        # - Database name for queries
+        # - Any specific Athena settings you use
+        
+        query_execution = self.athena_client.start_query_execution(
+            QueryString=query,
+            ResultConfiguration={
+                'OutputLocation': f"s3://{self.athena_config['results_bucket']}/query-results/"
+            },
+            WorkGroup=self.athena_config.get('workgroup', 'primary')
+        )
+        
+        execution_id = query_execution['QueryExecutionId']
+        
+        # Wait for completion
+        while True:
+            response = self.athena_client.get_query_execution(
+                QueryExecutionId=execution_id
+            )
+            
+            status = response['QueryExecution']['Status']['State']
+            
+            if status in ['SUCCEEDED']:
+                break
+            elif status in ['FAILED', 'CANCELLED']:
+                raise Exception(f"Query failed: {response['QueryExecution']['Status']}")
+            
+            time.sleep(1)
+        
+        # Get results
+        results = self.athena_client.get_query_results(
+            QueryExecutionId=execution_id
+        )
+        
+        # Parse results
+        rows = []
+        for row in results['ResultSet']['Rows'][1:]:  # Skip header
+            rows.append(tuple(col.get('VarCharValue', '') for col in row['Data']))
+        
+        return rows
+    
+    def get_table_recommendations(self, entities: List[str], 
+                                intent_type: str) -> List[Dict]:
+        """Recommend tables based on entities and intent"""
+        
+        # Method 1: Direct keyword matching
+        direct_matches = []
+        for entity in entities:
+            query = f"""
+            SELECT database_name, table_name, column_name, 
+                   CASE 
+                       WHEN LOWER(table_name) LIKE '%{entity.lower()}%' THEN 0.9
+                       WHEN LOWER(column_name) LIKE '%{entity.lower()}%' THEN 0.7
+                       ELSE 0.0 
+                   END as score
+            FROM table_metadata 
+            WHERE LOWER(table_name) LIKE '%{entity.lower()}%' 
+               OR LOWER(column_name) LIKE '%{entity.lower()}%'
+            ORDER BY score DESC
+            """
+            
+            results = self.metadata_db.execute(query).fetchall()
+            direct_matches.extend(results)
+        
+        # Method 2: Use relationship graph for connected tables
+        related_tables = set()
+        for match in direct_matches:
+            table_key = f"{match[0]}.{match[1]}"
+            if table_key in self.relationship_graph:
+                neighbors = list(self.relationship_graph.neighbors(table_key))
+                related_tables.update(neighbors)
+        
+        # Combine and rank recommendations
+        recommendations = self._rank_table_recommendations(
+            direct_matches, related_tables, intent_type
+        )
+        
+        return recommendations[:10]  # Top 10 recommendations
