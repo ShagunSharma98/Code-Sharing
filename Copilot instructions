@@ -1,0 +1,174 @@
+=== DATASET OVERVIEW ===
+This dataset supports acquisition analytics for credit card applications and approvals.
+
+It tracks application creation, approval decisions, inbound and outbound acquisition channels, and client product codes.
+
+The dataset is used for monitoring application volumes, approval performance, and channel effectiveness.
+
+Primary business analysis areas:
+• Application volume trends
+• Account approval performance
+• Channel acquisition performance
+• Product segment performance
+• Month-over-month and year-over-year growth analysis
+
+
+=== DATA GRAIN ===
+Each row in the acquisition_semantic_data table represents one completed application record.
+
+Other tables contain supporting dimensions for acquisition channels and product codes.
+
+
+=== TABLES ===
+[asd] Acquisition_semantic_data  
+Completed application transactions.  
+Grain: 1 row = 1 application record.
+
+[ibc] inbound_channels  
+Inbound acquisition channel definitions.  
+Grain: 1 row = 1 inbound channel.
+
+[obc] outbound_channels  
+Outbound acquisition channel definitions.  
+Grain: 1 row = 1 outbound channel.
+
+[cpc] cpc  
+Client product code information.  
+Grain: 1 row = 1 CPC.
+
+
+=== PRIMARY METRICS ===
+
+application_count
+Definition: Total number of applications submitted.
+Calculation: count(appl_id)
+Unit: count
+
+account_count
+Definition: Total number of approved applications converted into accounts.
+Calculation: count(appl_id where application_status = 'A')
+Unit: count
+
+approval_rate
+Definition: Percentage of approved accounts relative to total applications.
+Calculation: sum(account_count) / sum(application_count)
+Unit: percentage
+
+
+=== NAMING CONVENTIONS ===
+*_id → unique identifier
+*_count → aggregated count metric
+*_date → date field
+*_rate → calculated percentage metric
+
+Channel tables represent acquisition source attributes.
+
+
+=== GLOSSARY ===
+Application_count  
+Count of submitted credit card applications.
+
+Account_count  
+Count of applications that were approved and converted to accounts.
+
+Approval_rate  
+Approval ratio calculated as approved accounts divided by total applications.
+
+
+=== TIME DIMENSIONS ===
+
+application_creation_date  
+Date the application was submitted.
+
+system_decision_date  
+Date the approval or rejection decision was made.
+
+Date table should be used for time-series analysis.
+
+
+=== DIMENSIONS ===
+
+Inbound Channel  
+Channel through which the application originated from inbound sources.
+
+Outbound Channel  
+Channel through which the application originated from outbound campaigns.
+
+Client Product Code (CPC)  
+Product or card segment associated with the application.
+
+
+=== CALCULATION GUIDANCE ===
+
+Year-to-Date Application Count
+Count of applications where application_creation_date falls within the current year up to today's date.
+
+Year-to-Date Approval Rate
+sum(account_count) / sum(application_count) for the current year.
+
+Last Month Approval Rate
+Calculate approval rate using applications where system_decision_date falls in the previous month.
+
+Month-over-Month Account Change
+(current_month_account_count − previous_month_account_count) / previous_month_account_count
+
+Year-over-Year Growth
+(current_year_application_count / last_year_application_count) − 1
+
+
+=== DATA CHARACTERISTICS ===
+• Each application is represented once in the acquisition dataset.
+• Approval status determines whether an application becomes an account.
+• Date table should be used for all calendar-based filtering.
+
+
+=== COMMON BUSINESS QUESTIONS ===
+
+Year-to-Date application count.
+
+Year-to-Date approval rate.
+
+Last month approval rate.
+
+Month-over-month change in account approvals.
+
+Which product segment had the highest number of applications last month?
+
+Which segment has the highest approval rate?
+
+Which acquisition channels generate the highest applications?
+
+
+=== RESPONSE GUIDELINES ===
+When answering questions:
+
+Trend analysis → return metric values and compare previous period.
+
+Ranking questions → return top segments or channels sorted by metric.
+
+Approval analysis → calculate approval_rate using account_count / application_count.
+
+Growth questions → compute percent change between time periods.
+
+
+=== DEFAULT ANALYSIS RULES ===
+
+If timeframe is not specified → assume most recent full month.
+
+For trend analysis → use application_creation_date.
+
+For approval metrics → use system_decision_date.
+
+For segmentation → use CPC or acquisition channel.
+
+
+=== DATA PRIVACY ===
+This dataset contains aggregated application analytics only.
+
+No personally identifiable information should be exposed in responses.
+
+
+=== MODEL EXTENSIBILITY ===
+Future metrics should be added in the PRIMARY METRICS section.
+
+Future acquisition channels or product segments will follow the same naming conventions.
