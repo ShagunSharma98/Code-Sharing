@@ -1,0 +1,77 @@
+# Phase 1 — Clarifying Questions
+
+Before building out the strategy, I need to understand your specific context with enough precision to make defensible recommendations. Please answer all of the following in one response — partial answers are fine where you're unsure.
+
+---
+
+**SECTION A — Leadership & Decision-Making**
+
+1. Who are the primary target leaders for this initiative? (e.g., Chief Credit Officer, Head of Acquisitions, CFO, COO, VP Analytics, Risk Head, Business Unit Heads) — and roughly how many unique leader-level users are we designing for?
+
+2. How do these leaders currently consume insights today? (e.g., weekly static decks emailed by analysts, live dashboard reviews, ad hoc Slack/Teams requests, scheduled review meetings)
+
+3. What are the top 3 decisions these leaders make regularly where they feel they lack timely, trustworthy information? (e.g., channel spend reallocation, approval rate adjustments, bureau cut-off tuning, portfolio vintage review)
+
+4. When a leader has an unanswered question today, what does the current escalation path look like — and how long does it typically take from question to answer?
+
+---
+
+**SECTION B — Pain Points & Dashboard Failures**
+
+5. What specifically frustrates leaders about existing dashboards? (e.g., too much data without context, no narrative, can't drill to root cause, always stale by the time it's reviewed, too many dashboards with conflicting numbers)
+
+6. How often do leaders receive a dashboard/report and then come back to the analytics team with follow-up questions — and what kind of questions are those typically?
+
+7. Is there a trust deficit in the data today? If yes, what is it rooted in — definitional inconsistencies, pipeline reliability, metric disagreements between teams, something else?
+
+8. What decisions have been delayed, made incorrectly, or escalated unnecessarily because insight was unavailable or unclear?
+
+---
+
+**SECTION C — Current Tech Stack & Data Infrastructure**
+
+9. Which Microsoft licenses does your organization currently hold? (e.g., M365 E3/E5, Power BI Premium / PPU, Microsoft Fabric, Azure OpenAI Service, Copilot for M365) — and which of these are actively in use vs. licensed but dormant?
+
+10. Is the Copilot-in-Power-BI pilot already live with real users, or is it in a controlled sandbox? What's the current status — what's working, what isn't?
+
+11. How mature is your semantic layer? (e.g., certified datasets with business-friendly field names and measures, vs. raw tables that analysts query directly) — and is it governed / single-source-of-truth, or fragmented across teams?
+
+12. Where does your data live? (e.g., Azure Synapse, on-prem SQL Server, Snowflake, Fabric Lakehouse) — and is there an approved data warehouse or platform that leadership reporting runs on?
+
+13. Is Azure OpenAI Service already approved and available within your organization's cloud policy, or would invoking any LLM API require a new infra/vendor approval process?
+
+---
+
+**SECTION D — Governance, Risk & Regulatory Context**
+
+14. Does your organization have a Model Risk Management (MRM) framework — and has any AI/ML model used in a decision-support or reporting context been subject to MRM review before? What was that process like?
+
+15. What data residency requirements apply? (e.g., must data stay within India, within Azure India regions, within on-prem boundary)
+
+16. Are there explicit restrictions today on what data can be sent to external APIs or cloud-based LLMs? (e.g., no customer PII, no account-level data, aggregated metrics only)
+
+17. Is the DPDP Act (Digital Personal Data Protection Act, India) already influencing how your analytics or data teams handle customer data in new tooling?
+
+---
+
+**SECTION E — Failed or Stalled Initiatives**
+
+18. Has your team or the broader organization attempted any prior GenAI or advanced analytics initiative that stalled or failed? If yes — what happened, and what were the root causes? (e.g., governance blocked it, leaders didn't adopt, data wasn't ready, IT didn't approve the vendor)
+
+19. Are there any political or organizational dynamics I should know about — e.g., competing teams building similar solutions, skeptical senior stakeholders, turf issues with IT or risk?
+
+---
+
+**SECTION F — Appetite & Ambition**
+
+20. What is the organization's stated risk appetite for GenAI experimentation right now — quick wins within existing Microsoft licensing vs. open to net-new cloud/vendor investment?
+
+21. Is there a budget envelope (even directional) already allocated for this initiative — or does the business case need to justify the investment from scratch?
+
+22. What does success look like for *you* personally and for your team from this initiative — e.g., executive visibility, team capability building, a production system in 6 months, a pilot that unlocks further funding?
+
+23. On a scale of 1–5, how would you rate your team's current analytics maturity compared to peers within the broader organization — and where do you think the gaps are?
+
+---
+
+Take your time — the more specific your answers, the sharper the strategy I can build in Phase 2.
